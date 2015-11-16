@@ -19,64 +19,78 @@ package org.apache.spark.ml.feature
 
 import scala.beans.BeanInfo
 
-import org.scalatest.FunSuite
-
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.ml.param.ParamsSuite
 import org.apache.spark.mllib.util.MLlibTestSparkContext
-import org.apache.spark.sql.{DataFrame, Row, SQLContext}
+import org.apache.spark.sql.{DataFrame, Row}
 
 @BeanInfo
 case class TokenizerTestData(rawText: String, wantedTokens: Array[String])
 
-class RegexTokenizerSuite extends FunSuite with MLlibTestSparkContext {
-  import org.apache.spark.ml.feature.RegexTokenizerSuite._
-  
-  @transient var sqlContext: SQLContext = _
+class TokenizerSuite extends SparkFunSuite {
 
-  override def beforeAll(): Unit = {
-    super.beforeAll()
-    sqlContext = new SQLContext(sc)
-  }
-
-  test("RegexTokenizer") {
-    val tokenizer = new RegexTokenizer()
-      .setInputCol("rawText")
-      .setOutputCol("tokens")
-
-    val dataset0 = sqlContext.createDataFrame(Seq(
-      TokenizerTestData("Test for tokenization.", Array("Test", "for", "tokenization", ".")),
-      TokenizerTestData("Te,st. punct", Array("Te", ",", "st", ".", "punct"))
-    ))
-    testRegexTokenizer(tokenizer, dataset0)
-
-    val dataset1 = sqlContext.createDataFrame(Seq(
-      TokenizerTestData("Test for tokenization.", Array("Test", "for", "tokenization")),
-      TokenizerTestData("Te,st. punct", Array("punct"))
-    ))
-
-    tokenizer.setMinTokenLength(3)
-    testRegexTokenizer(tokenizer, dataset1)
-
-    tokenizer
-      .setPattern("\\s")
-      .setGaps(true)
-      .setMinTokenLength(0)
-    val dataset2 = sqlContext.createDataFrame(Seq(
-      TokenizerTestData("Test for tokenization.", Array("Test", "for", "tokenization.")),
-      TokenizerTestData("Te,st.  punct", Array("Te,st.", "", "punct"))
-    ))
-    testRegexTokenizer(tokenizer, dataset2)
+  test("params") {
+    ParamsSuite.checkParams(new Tokenizer)
   }
 }
 
-object RegexTokenizerSuite extends FunSuite {
+class RegexTokenizerSuite extends SparkFunSuite with MLlibTestSparkContext {
+  import org.apache.spark.ml.feature.RegexTokenizerSuite._
+
+  test("params") {
+    ParamsSuite.checkParams(new RegexTokenizer)
+  }
+
+  test("RegexTokenizer") {
+    val tokenizer0 = new RegexTokenizer()
+      .setGaps(false)
+      .setPattern("\\w+|\\p{Punct}")
+      .setInputCol("rawText")
+      .setOutputCol("tokens")
+    val dataset0 = sqlContext.createDataFrame(Seq(
+      TokenizerTestData("Test for tokenization.", Array("test", "for", "tokenization", ".")),
+      TokenizerTestData("Te,st. punct", Array("te", ",", "st", ".", "punct"))
+    ))
+    testRegexTokenizer(tokenizer0, dataset0)
+
+    val dataset1 = sqlContext.createDataFrame(Seq(
+      TokenizerTestData("Test for tokenization.", Array("test", "for", "tokenization")),
+      TokenizerTestData("Te,st. punct", Array("punct"))
+    ))
+    tokenizer0.setMinTokenLength(3)
+    testRegexTokenizer(tokenizer0, dataset1)
+
+    val tokenizer2 = new RegexTokenizer()
+      .setInputCol("rawText")
+      .setOutputCol("tokens")
+    val dataset2 = sqlContext.createDataFrame(Seq(
+      TokenizerTestData("Test for tokenization.", Array("test", "for", "tokenization.")),
+      TokenizerTestData("Te,st.  punct", Array("te,st.", "punct"))
+    ))
+    testRegexTokenizer(tokenizer2, dataset2)
+  }
+
+  test("RegexTokenizer with toLowercase false") {
+    val tokenizer = new RegexTokenizer()
+      .setInputCol("rawText")
+      .setOutputCol("tokens")
+      .setToLowercase(false)
+    val dataset = sqlContext.createDataFrame(Seq(
+      TokenizerTestData("JAVA SCALA", Array("JAVA", "SCALA")),
+      TokenizerTestData("java scala", Array("java", "scala"))
+    ))
+    testRegexTokenizer(tokenizer, dataset)
+  }
+}
+
+object RegexTokenizerSuite extends SparkFunSuite {
 
   def testRegexTokenizer(t: RegexTokenizer, dataset: DataFrame): Unit = {
     t.transform(dataset)
       .select("tokens", "wantedTokens")
       .collect()
-      .foreach {
-        case Row(tokens, wantedTokens) =>
-          assert(tokens === wantedTokens)
-    }
+      .foreach { case Row(tokens, wantedTokens) =>
+        assert(tokens === wantedTokens)
+      }
   }
 }
