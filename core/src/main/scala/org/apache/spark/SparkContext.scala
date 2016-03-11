@@ -45,7 +45,7 @@ import org.apache.hadoop.mapreduce.lib.input.{FileInputFormat => NewFileInputFor
 import org.apache.mesos.MesosNativeLibrary
 
 import org.apache.spark.annotation.{DeveloperApi, Experimental}
-import org.apache.spark.broadcast.Broadcast
+import org.apache.spark.broadcast.{ExecutorBroadcast, JoinBroadcast, Broadcast}
 import org.apache.spark.deploy.{LocalSparkCluster, SparkHadoopUtil}
 import org.apache.spark.executor.{ExecutorEndpoint, TriggerThreadDump}
 import org.apache.spark.input.{StreamInputFormat, PortableDataStream, WholeTextFileInputFormat,
@@ -1292,6 +1292,23 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
     val callSite = getCallSite
     logInfo("Created broadcast " + bc.id + " from " + callSite.shortForm)
     cleaner.foreach(_.registerBroadcastForCleanup(bc))
+    bc
+  }
+
+  // for joinBroadcast
+  def joinBroadcast[K: ClassTag, D: ClassTag](rdd: RDD[(K, D)]): JoinBroadcast[K, D] = {
+    val bc = env.broadcastManager.newJoinBroadcast(rdd)
+    cleaner.foreach(_.registerJoinBroadcastForCleanup(bc))
+    bc
+  }
+
+
+  /**
+   * broadcast among executors, without collect() to driver and broadcast() out
+   */
+  def executorBroadcast[D: ClassTag](rdd: RDD[D]): ExecutorBroadcast[D] = {
+    val bc = env.broadcastManager.newExecutorBroadcast(rdd)
+    cleaner.foreach(_.registerExecutorBroadcastForCleanup(bc))
     bc
   }
 

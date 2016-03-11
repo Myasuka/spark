@@ -354,6 +354,7 @@ private[spark] class ExternalSorter[K, V, C](
     if (partitionWriters == null) {
       curWriteMetrics = new ShuffleWriteMetrics()
       val openStartTime = System.nanoTime
+      val t = System.currentTimeMillis()
       partitionWriters = Array.fill(numPartitions) {
         // Because these files may be read during shuffle, their compression must be controlled by
         // spark.shuffle.compress instead of spark.shuffle.spill.compress, so we need to use
@@ -367,6 +368,7 @@ private[spark] class ExternalSorter[K, V, C](
       // the disk, and can take a long time in aggregate when we open many files, so should be
       // included in the shuffle write time.
       curWriteMetrics.incShuffleWriteTime(System.nanoTime - openStartTime)
+      logInfo(s"spill to partition files used: ${System.currentTimeMillis() - t} mills")
     }
 
     // No need to sort stuff, just write each element out
@@ -723,8 +725,9 @@ private[spark] class ExternalSorter[K, V, C](
 
     // Track location of each range in the output file
     val lengths = new Array[Long](numPartitions)
-
+    logInfo(s"aggregator.isDefined: ${aggregator.isDefined}, ordering.isDefined: ${ordering.isDefined}")
     if (bypassMergeSort && partitionWriters != null) {
+      logInfo(s"during shuffle write, bypass merge sort, partitionWriters.length: ${partitionWriters.length}")
       // We decided to write separate files for each partition, so just concatenate them. To keep
       // this simple we spill out the current in-memory collection so that everything is in files.
       spillToPartitionFiles(if (aggregator.isDefined) map else buffer)
@@ -735,7 +738,10 @@ private[spark] class ExternalSorter[K, V, C](
         for (i <- 0 until numPartitions) {
           val in = new FileInputStream(partitionWriters(i).fileSegment().file)
           util.Utils.tryWithSafeFinally {
+            val t = System.currentTimeMillis()
             lengths(i) = org.apache.spark.util.Utils.copyStream(in, out, false, transferToEnabled)
+            logInfo(s"during bypass merge sort, copyStream used time: ${System.currentTimeMillis() - t} mills " +
+              s"with length: ${lengths(i)}")
           } {
             in.close()
           }
@@ -746,12 +752,15 @@ private[spark] class ExternalSorter[K, V, C](
           _.incShuffleWriteTime(System.nanoTime - writeStartTime))
       }
     } else if (spills.isEmpty && partitionWriters == null) {
+      logInfo(s"during shuffle write, spill is Empty: ${spills.isEmpty} and partitionWriters is null")
       // Case where we only have in-memory data
       val collection = if (aggregator.isDefined) map else buffer
       val it = collection.destructiveSortedWritablePartitionedIterator(comparator)
+      var itCount = 0
       while (it.hasNext) {
         val writer = blockManager.getDiskWriter(blockId, outputFile, serInstance, fileBufferSize,
           context.taskMetrics.shuffleWriteMetrics.get)
+        itCount += 1
         val partitionId = it.nextPartition()
         while (it.hasNext && it.nextPartition() == partitionId) {
           it.writeNext(writer)
@@ -760,7 +769,9 @@ private[spark] class ExternalSorter[K, V, C](
         val segment = writer.fileSegment()
         lengths(partitionId) = segment.length
       }
+      logInfo(s"collection length: $itCount")
     } else {
+      logInfo(s"during shuffle write, Not bypassing merge-sort; get an iterator by partition and just write everything directly.")
       // Not bypassing merge-sort; get an iterator by partition and just write everything directly.
       for ((id, elements) <- this.partitionedIterator) {
         if (elements.hasNext) {

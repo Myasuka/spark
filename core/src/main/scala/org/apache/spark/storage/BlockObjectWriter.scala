@@ -141,8 +141,10 @@ private[spark] class DiskBlockObjectWriter(
           // Force outstanding writes to disk and track how long it takes
           objOut.flush()
           val start = System.nanoTime()
+          val t = System.currentTimeMillis()
           fos.getFD.sync()
           writeMetrics.incShuffleWriteTime(System.nanoTime() - start)
+          logInfo(s"shuffle write time used: ${System.currentTimeMillis() - t} mills")
         }
       } {
         objOut.close()
@@ -170,6 +172,7 @@ private[spark] class DiskBlockObjectWriter(
     }
     finalPosition = file.length()
     // In certain compression codecs, more bytes are written after close() is called
+    logInfo(s"DiskBlockObjectWriter write size: ${finalPosition - reportedPosition}")
     writeMetrics.incShuffleBytesWritten(finalPosition - reportedPosition)
   }
 
