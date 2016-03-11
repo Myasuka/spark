@@ -137,6 +137,20 @@ class BlockManagerMaster(
     }
   }
 
+  /** Remove all blocks belonging to the given broadcast. */
+  def removeJoinBroadcast(joinBroadcastId: Long,
+                          removeFromMaster: Boolean, blocking: Boolean): Unit = {
+    val future = driverEndpoint.askWithRetry[Future[Seq[Int]]](
+      RemoveJoinBroadcast(joinBroadcastId, removeFromMaster))
+    future.onFailure {
+      case e: Exception =>
+        logWarning(s"Failed to remove join broadcast $joinBroadcastId" +
+          s" with removeFromMaster = $removeFromMaster - ${e.getMessage}}")
+    }(ThreadUtils.sameThread)
+    if (blocking) {
+      Await.result(future, timeout)
+    }
+  }
   /**
    * Return the memory status for each block manager, in the form of a map from
    * the block manager's id to two long values. The first value is the maximum

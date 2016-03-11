@@ -22,9 +22,10 @@ import java.util.concurrent.{TimeUnit, ScheduledExecutorService}
 
 import scala.collection.mutable.{ArrayBuffer, SynchronizedBuffer}
 
-import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.{RDD, ReliableRDDCheckpointData}
 import org.apache.spark.util.{ThreadUtils, Utils}
+import org.apache.spark.broadcast.{ExecutorBroadcast, Broadcast, JoinBroadcast}
+import org.apache.spark.util.Utils
 
 /**
  * Classes that represent cleaning tasks.
@@ -33,6 +34,8 @@ private sealed trait CleanupTask
 private case class CleanRDD(rddId: Int) extends CleanupTask
 private case class CleanShuffle(shuffleId: Int) extends CleanupTask
 private case class CleanBroadcast(broadcastId: Long) extends CleanupTask
+private case class CleanJoinBroadcast(joinBroadcastId: Long) extends CleanupTask
+private case class CleanExecutorBroadcast(joinBroadcastId: Long) extends CleanupTask
 private case class CleanAccum(accId: Long) extends CleanupTask
 private case class CleanCheckpoint(rddId: Int) extends CleanupTask
 
@@ -164,6 +167,17 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
     registerForCleanup(rdd, CleanCheckpoint(parentId))
   }
 
+  // for join broadcast
+  def registerJoinBroadcastForCleanup[K, D](broadcast: JoinBroadcast[K, D]) {
+    registerForCleanup(broadcast, CleanJoinBroadcast(broadcast.id))
+  }
+
+  // for executor broadcast
+  def registerExecutorBroadcastForCleanup[D](broadcast: ExecutorBroadcast[D]) {
+    registerForCleanup(broadcast, CleanExecutorBroadcast(broadcast.id))
+  }
+
+
   /** Register an object for cleanup. */
   private def registerForCleanup(objectForCleanup: AnyRef, task: CleanupTask): Unit = {
     referenceBuffer += new CleanupTaskWeakReference(task, objectForCleanup, referenceQueue)
@@ -187,6 +201,8 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
                 doCleanupShuffle(shuffleId, blocking = blockOnShuffleCleanupTasks)
               case CleanBroadcast(broadcastId) =>
                 doCleanupBroadcast(broadcastId, blocking = blockOnCleanupTasks)
+              case CleanExecutorBroadcast(broadcastId) =>
+                doCleanupExecutorBroadcast(broadcastId, blocking = blockOnCleanupTasks)
               case CleanAccum(accId) =>
                 doCleanupAccum(accId, blocking = blockOnCleanupTasks)
               case CleanCheckpoint(rddId) =>
@@ -266,6 +282,29 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
     }
   }
 
+  // for join broadcast
+  def doCleanupJoinBroadcast(broadcastId: Long, blocking: Boolean): Unit = {
+    try {
+      logDebug("Cleaning join broadcast " + broadcastId)
+      broadcastManager.joinUnbroadcast(broadcastId, true, blocking)
+      listeners.foreach(_.joinBroadcastCleaned(broadcastId))
+      logInfo("Cleaned join broadcast " + broadcastId)
+    } catch {
+      case e: Exception => logError("Error cleaning broadcast " + broadcastId, e)
+    }
+  }
+
+  def doCleanupExecutorBroadcast(broadcastId: Long, blocking: Boolean): Unit = {
+    try {
+      logDebug("Cleaning executor broadcast " + broadcastId)
+      broadcastManager.unExecutorBroadcast(broadcastId, true, blocking)
+      listeners.foreach(_.executorBroadcastCleaned(broadcastId))
+      logInfo("Cleaned executor broadcast " + broadcastId)
+    } catch {
+      case e: Exception => logError("Error cleaning executor broadcast " + broadcastId, e)
+    }
+  }
+
   private def blockManagerMaster = sc.env.blockManager.master
   private def broadcastManager = sc.env.broadcastManager
   private def mapOutputTrackerMaster = sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
@@ -282,6 +321,8 @@ private[spark] trait CleanerListener {
   def rddCleaned(rddId: Int)
   def shuffleCleaned(shuffleId: Int)
   def broadcastCleaned(broadcastId: Long)
+  def joinBroadcastCleaned(broadcastId: Long)
+  def executorBroadcastCleaned(broadcastId: Long)
   def accumCleaned(accId: Long)
   def checkpointCleaned(rddId: Long)
 }

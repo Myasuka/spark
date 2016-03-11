@@ -101,8 +101,10 @@ private[spark] class DiskBlockObjectWriter(
           // Force outstanding writes to disk and track how long it takes
           objOut.flush()
           val start = System.nanoTime()
+          val t = System.currentTimeMillis()
           fos.getFD.sync()
           writeMetrics.incShuffleWriteTime(System.nanoTime() - start)
+          logInfo(s"shuffle write time used: ${System.currentTimeMillis() - t} mills")
         }
       } {
         objOut.close()
@@ -137,7 +139,7 @@ private[spark] class DiskBlockObjectWriter(
       finalPosition = file.length()
     }
     commitAndCloseHasBeenCalled = true
-  }
+   }
 
 
   /**
