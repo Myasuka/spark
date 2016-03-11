@@ -670,12 +670,15 @@ private[spark] class ExternalSorter[K, V, C](
     val lengths = new Array[Long](numPartitions)
 
     if (spills.isEmpty) {
+
       // Case where we only have in-memory data
       val collection = if (aggregator.isDefined) map else buffer
       val it = collection.destructiveSortedWritablePartitionedIterator(comparator)
+      var itCount = 0
       while (it.hasNext) {
         val writer = blockManager.getDiskWriter(blockId, outputFile, serInstance, fileBufferSize,
           context.taskMetrics.shuffleWriteMetrics.get)
+        itCount += 1
         val partitionId = it.nextPartition()
         while (it.hasNext && it.nextPartition() == partitionId) {
           it.writeNext(writer)
@@ -684,6 +687,7 @@ private[spark] class ExternalSorter[K, V, C](
         val segment = writer.fileSegment()
         lengths(partitionId) = segment.length
       }
+      logInfo(s"collection length: $itCount")
     } else {
       // We must perform merge-sort; get an iterator by partition and write everything directly.
       for ((id, elements) <- this.partitionedIterator) {

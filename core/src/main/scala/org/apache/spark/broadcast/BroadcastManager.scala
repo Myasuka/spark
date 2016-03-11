@@ -19,6 +19,10 @@ package org.apache.spark.broadcast
 
 import java.util.concurrent.atomic.AtomicLong
 
+import org.apache.spark.rdd.RDD
+import org.apache.spark.storage.{StorageLevel, JoinBroadcastBlockId, BroadcastBlockId}
+
+import scala.collection.mutable.HashMap
 import scala.reflect.ClassTag
 
 import org.apache.spark._
@@ -32,6 +36,11 @@ private[spark] class BroadcastManager(
 
   private var initialized = false
   private var broadcastFactory: BroadcastFactory = null
+  private var broadcastMap: HashMap[BroadcastBlockId, Any] = new HashMap[BroadcastBlockId, Any]()
+  private val cacheInBroadcastManager = conf.
+    getBoolean("spark.broadcast.CacheInBroadcastManager", true)
+  private var jBroadcastMap: HashMap[JoinBroadcastBlockId, Any] =
+    new HashMap[JoinBroadcastBlockId, Any]()
 
   initialize()
 
@@ -65,5 +74,75 @@ private[spark] class BroadcastManager(
 
   def unbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean) {
     broadcastFactory.unbroadcast(id, removeFromDriver, blocking)
+  }
+
+  // for join broadcast
+  def newJoinBroadcast[K: ClassTag, D: ClassTag](rdd: RDD[(K, D)]): JoinBroadcast[K, D] = {
+    assert(broadcastFactory.isInstanceOf[TorrentBroadcastFactory]) // TODO: if HTTP?
+    logInfo(s"broadcastFactory start new JoinBroadcast")
+    broadcastFactory.asInstanceOf[TorrentBroadcastFactory].
+      newJoinBroadcast[K, D](rdd, nextBroadcastId.getAndIncrement())
+  }
+
+  def newExecutorBroadcast[D: ClassTag](rdd: RDD[D]): ExecutorBroadcast[D] = {
+    assert(broadcastFactory.isInstanceOf[TorrentBroadcastFactory]) // TODO: if HTTP?
+    logInfo(s"broadcastFactory start new ExecutorBroadcast")
+    broadcastFactory.asInstanceOf[TorrentBroadcastFactory].
+      newExecutorBroadcast[D](rdd, nextBroadcastId.getAndIncrement())
+  }
+
+  def joinUnbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit = {
+    assert(broadcastFactory.isInstanceOf[TorrentBroadcastFactory]) // TODO: if HTTP?
+    broadcastFactory.asInstanceOf[TorrentBroadcastFactory].
+      joinUnbroadcast(id, removeFromDriver, blocking)
+  }
+
+  def unExecutorBroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit = {
+    assert(broadcastFactory.isInstanceOf[TorrentBroadcastFactory]) // TODO: if HTTP?
+    broadcastFactory.asInstanceOf[TorrentBroadcastFactory].
+      unbroadcast(id, removeFromDriver, blocking)
+  }
+
+  def getBroadcastValue(id: BroadcastBlockId): Option[Any] = {
+    if (cacheInBroadcastManager) {
+      logInfo(s"Get broadcast $id from BroadcastManager.")
+      broadcastMap.get(id)
+    } else {
+      logInfo(s"Get broadcast $id from BlockManager.")
+      SparkEnv.get.blockManager.getLocal(id).map(_.data.next())
+    }
+  }
+
+  def cacheBroadcast(id: BroadcastBlockId, value: Any): Unit = {
+    if (cacheInBroadcastManager) {
+      logInfo(s"Store broadcast $id in BroadcastManager.")
+      broadcastMap.put(id, value)
+    } else {
+      logInfo(s"Store broadcast $id in BlockManager.")
+      SparkEnv.get.blockManager.putSingle(id, value,
+        StorageLevel.MEMORY_AND_DISK, tellMaster = false)
+    }
+  }
+
+  def unCacheBroadCast(id: BroadcastBlockId): Unit = {
+    if (cacheInBroadcastManager) {
+      logInfo(s"Remove broadcast $id from BroadcastManager.")
+      broadcastMap.remove(id)
+    } else {
+      logInfo(s"Remove broadcast $id from BlockManager.")
+      SparkEnv.get.blockManager.removeBlock(id, true)
+    }
+  }
+
+  def getJoinBroadcastValue(id: JoinBroadcastBlockId): Option[Any] = {
+    jBroadcastMap.get(id)
+  }
+
+  def cacheJoinBroadcast(id: JoinBroadcastBlockId, value: Any) {
+    jBroadcastMap.put(id, value)
+  }
+
+  def unCacheJoinBroadCast(id: Long) {
+    jBroadcastMap = jBroadcastMap.filterNot(_._1.name.startsWith("join_broadcast_" + id))
   }
 }

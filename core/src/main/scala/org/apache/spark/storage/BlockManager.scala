@@ -1096,6 +1096,18 @@ private[spark] class BlockManager(
   }
 
   /**
+   * Remkove all blocks belonging to the given broadcast.
+   */
+  def removeJoinBroadcast(joinBroadcastId: Long, tellMaster: Boolean): Int = {
+    logInfo(s"Removing join broadcast $joinBroadcastId")
+    val blocksToRemove = blockInfo.keys.collect {
+      case bid @ JoinBroadcastBlockId(`joinBroadcastId`, _) => bid
+    }
+    blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster) }
+    blocksToRemove.size
+  }
+
+  /**
    * Remove a block from both memory and disk.
    */
   def removeBlock(blockId: BlockId, tellMaster: Boolean = true): Unit = {

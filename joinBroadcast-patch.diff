@@ -1,0 +1,603 @@
+From 5aaa6e0ac41416f25e0437afc5cb9d0c61c41a9c Mon Sep 17 00:00:00 2001
+From: Myasuka <tangyun23@gmail.com>
+Date: Wed, 8 Apr 2015 14:30:50 +0800
+Subject: [PATCH] JoinBroadcast 1st version
+
+---
+ .../scala/org/apache/spark/ContextCleaner.scala    |  22 +++-
+ .../main/scala/org/apache/spark/SparkContext.scala |   8 +-
+ .../apache/spark/broadcast/BroadcastManager.scala  |  66 ++++++++++
+ .../org/apache/spark/broadcast/JoinBroadcast.scala | 140 +++++++++++++++++++++
+ .../apache/spark/broadcast/TorrentBroadcast.scala  |   3 +-
+ .../spark/broadcast/TorrentBroadcastFactory.scala  |   8 ++
+ .../scala/org/apache/spark/storage/BlockId.scala   |  10 ++
+ .../org/apache/spark/storage/BlockManager.scala    |  12 ++
+ .../apache/spark/storage/BlockManagerMaster.scala  |  14 +++
+ .../spark/storage/BlockManagerMasterActor.scala    |  17 +++
+ .../spark/storage/BlockManagerMessages.scala       |   2 +
+ .../spark/storage/BlockManagerSlaveActor.scala     |   6 +
+ .../org/apache/spark/ContextCleanerSuite.scala     |   5 +
+ .../apache/spark/examples/JoinBroadcastTest.scala  |  34 +++++
+ 14 files changed, 343 insertions(+), 4 deletions(-)
+ create mode 100644 core/src/main/scala/org/apache/spark/broadcast/JoinBroadcast.scala
+ create mode 100644 examples/src/main/scala/org/apache/spark/examples/JoinBroadcastTest.scala
+
+diff --git a/core/src/main/scala/org/apache/spark/ContextCleaner.scala b/core/src/main/scala/org/apache/spark/ContextCleaner.scala
+index 98e4401..98ee7bd 100644
+--- a/core/src/main/scala/org/apache/spark/ContextCleaner.scala
++++ b/core/src/main/scala/org/apache/spark/ContextCleaner.scala
+@@ -21,7 +21,7 @@ import java.lang.ref.{ReferenceQueue, WeakReference}
+ 
+ import scala.collection.mutable.{ArrayBuffer, SynchronizedBuffer}
+ 
+-import org.apache.spark.broadcast.Broadcast
++import org.apache.spark.broadcast.{Broadcast, JoinBroadcast}
+ import org.apache.spark.rdd.RDD
+ import org.apache.spark.util.Utils
+ 
+@@ -32,6 +32,8 @@ private sealed trait CleanupTask
+ private case class CleanRDD(rddId: Int) extends CleanupTask
+ private case class CleanShuffle(shuffleId: Int) extends CleanupTask
+ private case class CleanBroadcast(broadcastId: Long) extends CleanupTask
++// for joinBroadcast
++private case class CleanJoinBroadcast(joinBroadcastId: Long) extends CleanupTask
+ 
+ /**
+  * A WeakReference associated with a CleanupTask.
+@@ -134,6 +136,11 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
+     registerForCleanup(broadcast, CleanBroadcast(broadcast.id))
+   }
+ 
++  // for join broadcast
++  def registerJoinBroadcastForCleanup[K, D](broadcast: JoinBroadcast[K, D]) {
++    registerForCleanup(broadcast, CleanJoinBroadcast(broadcast.id))
++  }
++
+   /** Register an object for cleanup. */
+   private def registerForCleanup(objectForCleanup: AnyRef, task: CleanupTask) {
+     referenceBuffer += new CleanupTaskWeakReference(task, objectForCleanup, referenceQueue)
+@@ -204,6 +211,18 @@ private[spark] class ContextCleaner(sc: SparkContext) extends Logging {
+     }
+   }
+ 
++  // for join broadcast
++  def doCleanupJoinBroadcast(broadcastId: Long, blocking: Boolean): Unit = {
++    try {
++      logDebug("Cleaning join broadcast " + broadcastId)
++      broadcastManager.joinUnbroadcast(broadcastId, true, blocking)
++      listeners.foreach(_.joinBroadcastCleaned(broadcastId))
++      logInfo("Cleaned join broadcast " + broadcastId)
++    } catch {
++      case e: Exception => logError("Error cleaning broadcast " + broadcastId, e)
++    }
++  }
++
+   private def blockManagerMaster = sc.env.blockManager.master
+   private def broadcastManager = sc.env.broadcastManager
+   private def mapOutputTrackerMaster = sc.env.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+@@ -220,4 +239,5 @@ private[spark] trait CleanerListener {
+   def rddCleaned(rddId: Int)
+   def shuffleCleaned(shuffleId: Int)
+   def broadcastCleaned(broadcastId: Long)
++  def joinBroadcastCleaned(broadcastId: Long)
+ }
+diff --git a/core/src/main/scala/org/apache/spark/SparkContext.scala b/core/src/main/scala/org/apache/spark/SparkContext.scala
+index 495227b..20ab3e1 100644
+--- a/core/src/main/scala/org/apache/spark/SparkContext.scala
++++ b/core/src/main/scala/org/apache/spark/SparkContext.scala
+@@ -46,7 +46,7 @@ import org.apache.hadoop.mapreduce.lib.input.{FileInputFormat => NewFileInputFor
+ import org.apache.mesos.MesosNativeLibrary
+ 
+ import org.apache.spark.annotation.{DeveloperApi, Experimental}
+-import org.apache.spark.broadcast.Broadcast
++import org.apache.spark.broadcast.{JoinBroadcast, Broadcast}
+ import org.apache.spark.deploy.{LocalSparkCluster, SparkHadoopUtil}
+ import org.apache.spark.executor.TriggerThreadDump
+ import org.apache.spark.input.{StreamInputFormat, PortableDataStream, WholeTextFileInputFormat,
+@@ -1055,6 +1055,12 @@ class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationCli
+     bc
+   }
+ 
++  // for joinBroadcast
++  def joinBroadcast[K: ClassTag, D: ClassTag](rdd: RDD[(K, D)]): JoinBroadcast[K, D] = {
++    val bc = env.broadcastManager.newJoinBroadcast(rdd)
++    cleaner.foreach(_.registerJoinBroadcastForCleanup(bc))
++    bc
++  }
+   /**
+    * Add a file to be downloaded with this Spark job on every node.
+    * The `path` passed can be either a local file, a file in HDFS (or other Hadoop-supported
+diff --git a/core/src/main/scala/org/apache/spark/broadcast/BroadcastManager.scala b/core/src/main/scala/org/apache/spark/broadcast/BroadcastManager.scala
+index 8f8a0b1..1b78ef2 100644
+--- a/core/src/main/scala/org/apache/spark/broadcast/BroadcastManager.scala
++++ b/core/src/main/scala/org/apache/spark/broadcast/BroadcastManager.scala
+@@ -19,6 +19,10 @@ package org.apache.spark.broadcast
+ 
+ import java.util.concurrent.atomic.AtomicLong
+ 
++import org.apache.spark.rdd.RDD
++import org.apache.spark.storage.{StorageLevel, JoinBroadcastBlockId, BroadcastBlockId}
++
++import scala.collection.mutable.HashMap
+ import scala.reflect.ClassTag
+ 
+ import org.apache.spark._
+@@ -31,6 +35,11 @@ private[spark] class BroadcastManager(
+ 
+   private var initialized = false
+   private var broadcastFactory: BroadcastFactory = null
++  private var broadcastMap: HashMap[BroadcastBlockId, Any] = new HashMap[BroadcastBlockId, Any]()
++  private val cacheInBroadcastManager = conf.
++    getBoolean("spark.broadcast.CacheInBroadcastManager", true)
++  private var jBroadcastMap: HashMap[JoinBroadcastBlockId, Any] =
++    new HashMap[JoinBroadcastBlockId, Any]()
+ 
+   initialize()
+ 
+@@ -65,4 +74,61 @@ private[spark] class BroadcastManager(
+   def unbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean) {
+     broadcastFactory.unbroadcast(id, removeFromDriver, blocking)
+   }
++
++  /** for join broadcast **/
++  def newJoinBroadcast[K: ClassTag, D: ClassTag](rdd: RDD[(K, D)]) = {
++    assert(broadcastFactory.isInstanceOf[TorrentBroadcastFactory]) // TODO: if HTTP?
++    logInfo(s"broadcastFactory start new JoinBroadcast")
++    broadcastFactory.asInstanceOf[TorrentBroadcastFactory].
++      newJoinBroadcast[K, D](rdd, nextBroadcastId.getAndIncrement())
++  }
++
++  def joinUnbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit = {
++    assert(broadcastFactory.isInstanceOf[TorrentBroadcastFactory]) // TODO: if HTTP?
++    broadcastFactory.asInstanceOf[TorrentBroadcastFactory].
++      joinUnbroadcast(id, removeFromDriver, blocking)
++  }
++
++  def getBroadcastValue(id: BroadcastBlockId): Option[Any] = {
++    if (cacheInBroadcastManager) {
++      logInfo(s"Get broadcast $id from BroadcastManager.")
++      broadcastMap.get(id)
++    } else {
++      logInfo(s"Get broadcast $id from BlockManager.")
++      SparkEnv.get.blockManager.getLocal(id).map(_.data.next())
++    }
++  }
++
++  def cacheBroadcast(id: BroadcastBlockId, value: Any): Unit = {
++    if (cacheInBroadcastManager) {
++      logInfo(s"Store broadcast $id in BroadcastManager.")
++      broadcastMap.put(id, value)
++    } else {
++      logInfo(s"Store broadcast $id in BlockManager.")
++      SparkEnv.get.blockManager.putSingle(id, value,
++        StorageLevel.MEMORY_AND_DISK, tellMaster = false)
++    }
++  }
++
++  def unCacheBroadCast(id: BroadcastBlockId): Unit ={
++    if (cacheInBroadcastManager) {
++      logInfo(s"Remove broadcast $id from BroadcastManager.")
++      broadcastMap.remove(id)
++    } else {
++      logInfo(s"Remove broadcast $id from BlockManager.")
++      SparkEnv.get.blockManager.removeBlock(id, true)
++    }
++  }
++
++  def getJoinBroadcastValue(id: JoinBroadcastBlockId): Option[Any] = {
++    jBroadcastMap.get(id)
++  }
++
++  def cacheJoinBroadcast(id: JoinBroadcastBlockId, value: Any) {
++    jBroadcastMap.put(id, value)
++  }
++
++  def unCacheJoinBroadCast(id: Long) {
++    jBroadcastMap = jBroadcastMap.filterNot(_._1.name.startsWith("join_broadcast_" + id))
++  }
+ }
+diff --git a/core/src/main/scala/org/apache/spark/broadcast/JoinBroadcast.scala b/core/src/main/scala/org/apache/spark/broadcast/JoinBroadcast.scala
+new file mode 100644
+index 0000000..11dc2b1
+--- /dev/null
++++ b/core/src/main/scala/org/apache/spark/broadcast/JoinBroadcast.scala
+@@ -0,0 +1,140 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.broadcast
++
++import java.io.Serializable
++import java.nio.ByteBuffer
++
++import org.apache.spark.io.CompressionCodec
++import org.apache.spark.rdd.RDD
++import org.apache.spark.storage.{JoinBroadcastBlockId, StorageLevel}
++import org.apache.spark.{Logging, SparkConf, SparkEnv, SparkException}
++
++import scala.reflect.ClassTag
++import scala.util.Random
++
++private[spark] class JoinBroadcast[K: ClassTag, D: ClassTag](rdd: RDD[(K, D)], val id: Long)
++  extends Serializable with Logging{
++
++  private val executorBroadcastId = JoinBroadcastBlockId(id)
++
++  /** The compression codec to use, or None if compression is disabled */
++  @transient private var compressionCodec: Option[CompressionCodec] = _
++//  /** Size of each block. Default value is 4MB.  This value is only read by the broadcaster. */
++//  @transient private var blockSize: Int =
++//    SparkEnv.get.conf.getInt("spark.broadcast.blockSize", 4096) * 1024
++//
++  private def setConf(conf: SparkConf) {
++    logInfo(s"start set conf in joinboradcast")
++    compressionCodec = if (conf.getBoolean("spark.broadcast.compress", true)) {
++      Some(CompressionCodec.createCodec(conf))
++    } else {
++      None
++    }
++    println(s"conf executorBroadcastId : $executorBroadcastId")
++  }
++  setConf(SparkEnv.get.conf)
++
++  private val numBlocksMap = writeBlocksMap(rdd)
++
++  def writeBlocksMap[K](rdd: RDD[(K, D)]): Map[K, Int]={
++    rdd.map { case (key, data) =>
++//      logInfo(s"join broadcast data to String: ${data.toString}")
++      val compressionCodec: Option[CompressionCodec] =
++        Some(CompressionCodec.createCodec(SparkEnv.get.conf))
++      logInfo(s"join broadcast compressionCodec: ${compressionCodec.toString}")
++      val blockSize: Int =
++        SparkEnv.get.conf.getInt("spark.broadcast.blockSize", 4096) * 1024
++      logInfo(s"join broadcast blockSize: $blockSize")
++
++      //      logInfo(s"join broadcast default compress: ${
++      //        SparkEnv.get.conf.getBoolean("spark.broadcast.compress", true)}")
++
++      val blocks = TorrentBroadcast.blockifyObject(data,
++        blockSize, SparkEnv.get.serializer, compressionCodec)
++      blocks.zipWithIndex.foreach { case (block, i) =>
++        SparkEnv.get.blockManager.putBytes(
++          JoinBroadcastBlockId(id, "key" + key + "piece" + i),
++          block,
++          StorageLevel.MEMORY_AND_DISK_SER,
++          tellMaster = true)
++      }
++      (key, blocks.length)
++    }.collect().toMap
++//      collectAsMap().asInstanceOf[Map[K, Int]]
++  }
++
++  def destroy(blocking: Boolean = true) {
++    JoinBroadcast.unpersist(id, removeFromDriver = true, blocking)
++  }
++
++  def getValue(key: K): D = {
++    logInfo(s"start get value")
++    val numBlocks = numBlocksMap.get(key)
++    assert(numBlocks.isDefined)
++    val blocks = new Array[ByteBuffer](numBlocks.get)
++    val bm = SparkEnv.get.blockManager
++
++    TorrentBroadcast.synchronized {
++      for (pid <- Random.shuffle(Seq.range(0, numBlocks.get))) {
++        val pieceId = JoinBroadcastBlockId(id, "key" + key + "piece" + pid)
++
++        // First try getLocalBytes because there is a chance that previous attempts to fetch the
++        // broadcast blocks have already fetched some of the blocks. In that case, some blocks
++        // would be available locally (on this executor).
++        var blockOpt = bm.getLocalBytes(pieceId)
++
++        if (!blockOpt.isDefined) {
++          logInfo(s"get joinBroadcast block from remote node")
++          blockOpt = bm.getRemoteBytes(pieceId)
++          blockOpt match {
++            case Some(block) =>
++              // If we found the block from remote executors/driver's BlockManager, put the block
++              // in this executor's BlockManager.
++              SparkEnv.get.blockManager.putBytes(
++                pieceId,
++                block,
++                StorageLevel.MEMORY_AND_DISK_SER,
++                tellMaster = true)
++
++            case None =>
++              throw new SparkException("Failed to get " + pieceId + " of " + executorBroadcastId)
++          }
++        } else {
++          logInfo(s"get joinBroadcast block local")
++        }
++        // If we get here, the option is defined.
++        blocks(pid) = blockOpt.get
++      }
++//      logInfo(s"get join broadcast compressionCodec: ${compressionCodec.toString}")
++      val value = TorrentBroadcast.unBlockifyObject[D](blocks,
++        SparkEnv.get.serializer, Some(CompressionCodec.createCodec(SparkEnv.get.conf)))
++      SparkEnv.get.broadcastManager.cacheJoinBroadcast(
++        JoinBroadcastBlockId(id, "key" + key), value)
++      value
++    }
++  }
++}
++
++private object JoinBroadcast {
++  def unpersist(id: Long, removeFromDriver: Boolean, blocking: Boolean) = {
++    SparkEnv.get.blockManager.master.removeJoinBroadcast(id, removeFromDriver, blocking)
++    SparkEnv.get.broadcastManager.unCacheJoinBroadCast(id)
++  }
++}
++
+diff --git a/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcast.scala b/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcast.scala
+index 94142d3..d7254f2 100644
+--- a/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcast.scala
++++ b/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcast.scala
+@@ -95,8 +95,7 @@ private[spark] class TorrentBroadcast[T: ClassTag](obj: T, id: Long)
+   private def writeBlocks(value: T): Int = {
+     // Store a copy of the broadcast variable in the driver so that tasks run on the driver
+     // do not create a duplicate copy of the broadcast variable's value.
+-    SparkEnv.get.blockManager.putSingle(broadcastId, value, StorageLevel.MEMORY_AND_DISK,
+-      tellMaster = false)
++    SparkEnv.get.broadcastManager.cacheBroadcast(broadcastId, value)
+     val blocks =
+       TorrentBroadcast.blockifyObject(value, blockSize, SparkEnv.get.serializer, compressionCodec)
+     blocks.zipWithIndex.foreach { case (block, i) =>
+diff --git a/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcastFactory.scala b/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcastFactory.scala
+index fb024c1..c1aa9b9 100644
+--- a/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcastFactory.scala
++++ b/core/src/main/scala/org/apache/spark/broadcast/TorrentBroadcastFactory.scala
+@@ -19,6 +19,7 @@ package org.apache.spark.broadcast
+ 
+ import scala.reflect.ClassTag
+ 
++import org.apache.spark.rdd.RDD
+ import org.apache.spark.{SecurityManager, SparkConf}
+ 
+ /**
+@@ -34,6 +35,9 @@ class TorrentBroadcastFactory extends BroadcastFactory {
+     new TorrentBroadcast[T](value_, id)
+   }
+ 
++  def newJoinBroadcast[K: ClassTag, D: ClassTag](rdd: RDD[(K, D)], id: Long) =
++    new JoinBroadcast[K, D](rdd, id)
++
+   override def stop() { }
+ 
+   /**
+@@ -44,4 +48,8 @@ class TorrentBroadcastFactory extends BroadcastFactory {
+   override def unbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean) {
+     TorrentBroadcast.unpersist(id, removeFromDriver, blocking)
+   }
++
++  def joinUnbroadcast(id: Long, removeFromDriver: Boolean, blocking: Boolean): Unit = {
++    JoinBroadcast.unpersist(id, removeFromDriver, blocking)
++  }
+ }
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockId.scala b/core/src/main/scala/org/apache/spark/storage/BlockId.scala
+index 1f01294..43c514a 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockId.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockId.scala
+@@ -39,6 +39,7 @@ sealed abstract class BlockId {
+   def isRDD = isInstanceOf[RDDBlockId]
+   def isShuffle = isInstanceOf[ShuffleBlockId]
+   def isBroadcast = isInstanceOf[BroadcastBlockId]
++  def isJoinBroadcast = isInstanceOf[JoinBroadcastBlockId]
+ 
+   override def toString = name
+   override def hashCode = name.hashCode
+@@ -90,6 +91,12 @@ private[spark] case class TempLocalBlockId(id: UUID) extends BlockId {
+   def name = "temp_local_" + id
+ }
+ 
++// for JoinBroadcast
++@DeveloperApi
++case class JoinBroadcastBlockId(broadcastId: Long, field: String = "") extends BlockId {
++  def name = "join_broadcast_" + broadcastId + (if (field == "") "" else "_" + field)
++}
++
+ /** Id associated with temporary shuffle data managed as blocks. Not serializable. */
+ private[spark] case class TempShuffleBlockId(id: UUID) extends BlockId {
+   def name = "temp_shuffle_" + id
+@@ -107,6 +114,7 @@ object BlockId {
+   val SHUFFLE_DATA = "shuffle_([0-9]+)_([0-9]+)_([0-9]+).data".r
+   val SHUFFLE_INDEX = "shuffle_([0-9]+)_([0-9]+)_([0-9]+).index".r
+   val BROADCAST = "broadcast_([0-9]+)([_A-Za-z0-9]*)".r
++  val JOINBROADCAST = "join_broadcast_([0-9]+)([_A-Za-z0-9.\\@]*)".r
+   val TASKRESULT = "taskresult_([0-9]+)".r
+   val STREAM = "input-([0-9]+)-([0-9]+)".r
+   val TEST = "test_(.*)".r
+@@ -123,6 +131,8 @@ object BlockId {
+       ShuffleIndexBlockId(shuffleId.toInt, mapId.toInt, reduceId.toInt)
+     case BROADCAST(broadcastId, field) =>
+       BroadcastBlockId(broadcastId.toLong, field.stripPrefix("_"))
++    case JOINBROADCAST(broadcastId, field) =>
++      JoinBroadcastBlockId(broadcastId.toLong, field.stripPrefix("_"))
+     case TASKRESULT(taskId) =>
+       TaskResultBlockId(taskId.toLong)
+     case STREAM(streamId, uniqueId) =>
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManager.scala b/core/src/main/scala/org/apache/spark/storage/BlockManager.scala
+index 86dbd89..8916095 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManager.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManager.scala
+@@ -1083,6 +1083,18 @@ private[spark] class BlockManager(
+   }
+ 
+   /**
++   * Remkove all blocks belonging to the given broadcast.
++   */
++  def removeJoinBroadcast(joinBroadcastId: Long, tellMaster: Boolean): Int = {
++    logInfo(s"Removing join broadcast $joinBroadcastId")
++    val blocksToRemove = blockInfo.keys.collect {
++      case bid @ JoinBroadcastBlockId(`joinBroadcastId`, _) => bid
++    }
++    blocksToRemove.foreach { blockId => removeBlock(blockId, tellMaster) }
++    blocksToRemove.size
++  }
++
++  /**
+    * Remove a block from both memory and disk.
+    */
+   def removeBlock(blockId: BlockId, tellMaster: Boolean = true): Unit = {
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala
+index b63c7f1..f34e467 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerMaster.scala
+@@ -138,6 +138,20 @@ class BlockManagerMaster(
+     }
+   }
+ 
++  /** Remove all blocks belonging to the given broadcast. */
++  def removeJoinBroadcast(joinBroadcastId: Long,
++                          removeFromMaster: Boolean, blocking: Boolean): Unit = {
++    val future = askDriverWithReply[Future[Seq[Int]]](
++      RemoveJoinBroadcast(joinBroadcastId, removeFromMaster))
++    future.onFailure {
++      case e: Exception =>
++        logWarning(s"Failed to remove join broadcast $joinBroadcastId" +
++          s" with removeFromMaster = $removeFromMaster - ${e.getMessage}}")
++    }
++    if (blocking) {
++      Await.result(future, timeout)
++    }
++  }
+   /**
+    * Return the memory status for each block manager, in the form of a map from
+    * the block manager's id to two long values. The first value is the maximum
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterActor.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterActor.scala
+index 6413346..a669e24 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterActor.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerMasterActor.scala
+@@ -108,6 +108,9 @@ class BlockManagerMasterActor(val isLocal: Boolean, conf: SparkConf, listenerBus
+     case RemoveBroadcast(broadcastId, removeFromDriver) =>
+       sender ! removeBroadcast(broadcastId, removeFromDriver)
+ 
++    case RemoveJoinBroadcast(joinBroadcastId, removeFromDriver) =>
++      sender ! removeJoinBroadcast(joinBroadcastId, removeFromDriver)
++
+     case RemoveBlock(blockId) =>
+       removeBlockFromWorkers(blockId)
+       sender ! true
+@@ -186,6 +189,20 @@ class BlockManagerMasterActor(val isLocal: Boolean, conf: SparkConf, listenerBus
+     )
+   }
+ 
++  private def removeJoinBroadcast(id: Long, removeFromDriver: Boolean): Future[Seq[Int]] = {
++    // TODO: Consolidate usages of <driver>
++    import context.dispatcher
++    val removeMsg = RemoveJoinBroadcast(id, removeFromDriver)
++    val requiredBlockManagers = blockManagerInfo.values.filter { info =>
++      removeFromDriver || info.blockManagerId.executorId != "<driver>"
++    }
++    Future.sequence(
++      requiredBlockManagers.map { bm =>
++        bm.slaveActor.ask(removeMsg)(akkaTimeout).mapTo[Int]
++      }.toSeq
++    )
++  }
++
+   private def removeBlockManager(blockManagerId: BlockManagerId) {
+     val info = blockManagerInfo(blockManagerId)
+ 
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala
+index 3f32099..5b81c62 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerMessages.scala
+@@ -43,6 +43,8 @@ private[spark] object BlockManagerMessages {
+   case class RemoveBroadcast(broadcastId: Long, removeFromDriver: Boolean = true)
+     extends ToBlockManagerSlave
+ 
++  case class RemoveJoinBroadcast(joinBroadcastId: Long, removeFromDriver: Boolean = true)
++    extends ToBlockManagerSlave
+ 
+   //////////////////////////////////////////////////////////////////////////////////
+   // Messages from slaves to the master.
+diff --git a/core/src/main/scala/org/apache/spark/storage/BlockManagerSlaveActor.scala b/core/src/main/scala/org/apache/spark/storage/BlockManagerSlaveActor.scala
+index 8462871..33bbf20 100644
+--- a/core/src/main/scala/org/apache/spark/storage/BlockManagerSlaveActor.scala
++++ b/core/src/main/scala/org/apache/spark/storage/BlockManagerSlaveActor.scala
+@@ -63,6 +63,12 @@ class BlockManagerSlaveActor(
+         blockManager.removeBroadcast(broadcastId, tellMaster = true)
+       }
+ 
++    case RemoveJoinBroadcast(joinBroadcastId, tellMaster) =>
++      doAsync[Int]("removing broadcast " + joinBroadcastId, sender) {
++        SparkEnv.get.broadcastManager.unCacheJoinBroadCast(joinBroadcastId)
++        blockManager.removeJoinBroadcast(joinBroadcastId, tellMaster)
++      }
++
+     case GetBlockStatus(blockId, _) =>
+       sender ! blockManager.getStatus(blockId)
+ 
+diff --git a/core/src/test/scala/org/apache/spark/ContextCleanerSuite.scala b/core/src/test/scala/org/apache/spark/ContextCleanerSuite.scala
+index ae2ae7e..fffa6ed 100644
+--- a/core/src/test/scala/org/apache/spark/ContextCleanerSuite.scala
++++ b/core/src/test/scala/org/apache/spark/ContextCleanerSuite.scala
+@@ -382,6 +382,11 @@ class CleanerTester(
+       toBeCleanedBroadcstIds -= broadcastId
+       logInfo("Broadcast" + broadcastId + " cleaned")
+     }
++
++    def joinBroadcastCleaned(broadcastId: Long): Unit =  {
++      toBeCleanedBroadcstIds -= broadcastId
++      logInfo("Join broadcast" + broadcastId + " clenaed")
++    }
+   }
+ 
+   val MAX_VALIDATION_ATTEMPTS = 10
+diff --git a/examples/src/main/scala/org/apache/spark/examples/JoinBroadcastTest.scala b/examples/src/main/scala/org/apache/spark/examples/JoinBroadcastTest.scala
+new file mode 100644
+index 0000000..f151b6f
+--- /dev/null
++++ b/examples/src/main/scala/org/apache/spark/examples/JoinBroadcastTest.scala
+@@ -0,0 +1,34 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.examples
++
++import org.apache.spark.{SparkContext, SparkConf}
++
++object JoinBroadcastTest {
++  def main(args: Array[String]) {
++    val conf = new SparkConf().setAppName("test join broadcast").setMaster("local[4]")
++    val sc = new SparkContext(conf)
++    val w = sc.parallelize(Array((1, 2), (2, 4), (3, 5)))
++    val data = sc.parallelize(Array((1, 6), (2, 6), (3, 7)))
++    val bcw = data.sparkContext.joinBroadcast(w)
++    data.map{ case (key, v) =>
++      (key, v * bcw.getValue(key))
++    }.collect().foreach(println)
++  }
++
++}
+-- 
+1.9.5.msysgit.1
+

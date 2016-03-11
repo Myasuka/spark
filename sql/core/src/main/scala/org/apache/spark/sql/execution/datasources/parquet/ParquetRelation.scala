@@ -313,7 +313,7 @@ private[sql] class ParquetRelation(
 
     Utils.withDummyCallSite(sqlContext.sparkContext) {
       new SqlNewHadoopRDD(
-        sc = sqlContext.sparkContext,
+        sqlContext.sparkContext,
         broadcastedConf = broadcastedConf,
         initDriverSideJobFuncOpt = Some(setInputPaths),
         initLocalJobFuncOpt = Some(initLocalJobFuncOpt),
