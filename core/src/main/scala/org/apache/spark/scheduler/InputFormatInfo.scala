@@ -103,7 +103,7 @@ class InputFormatInfo(val configuration: Configuration, val inputFormatClazz: Cl
     val instance: org.apache.hadoop.mapreduce.InputFormat[_, _] =
       ReflectionUtils.newInstance(inputFormatClazz.asInstanceOf[Class[_]], conf).asInstanceOf[
         org.apache.hadoop.mapreduce.InputFormat[_, _]]
-    val job = new Job(conf)
+    val job = Job.getInstance(conf)
 
     val retval = new ArrayBuffer[SplitInfo]()
     val list = instance.getSplits(job)
@@ -173,7 +173,7 @@ object InputFormatInfo {
     for (inputSplit <- formats) {
       val splits = inputSplit.findPreferredLocations()
 
-      for (split <- splits){
+      for (split <- splits) {
         val location = split.hostLocation
         val set = nodeToSplit.getOrElseUpdate(location, new HashSet[SplitInfo])
         set += split
