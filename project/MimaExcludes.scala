@@ -158,7 +158,13 @@ object MimaExcludes {
       ) ++ Seq(
         // SPARK-3580 Add getNumPartitions method to JavaRDD
         ProblemFilters.exclude[MissingMethodProblem](
-          "org.apache.spark.api.java.JavaRDDLike.getNumPartitions")
+          "org.apache.spark.api.java.JavaRDDLike.getNumPartitions"),
+        // SPARK-13465 TaskContext.
+        ProblemFilters.exclude[MissingMethodProblem]("org.apache.spark.TaskContext.addTaskFailureListener")
+      ) ++ Seq(
+        // SPARK-12591 Register OpenHashMapBasedStateMap for Kryo
+        ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.serializer.KryoInputDataInputBridge"),
+        ProblemFilters.exclude[MissingClassProblem]("org.apache.spark.serializer.KryoOutputDataOutputBridge")
       )
     case v if v.startsWith("1.5") =>
       Seq(
