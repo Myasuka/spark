@@ -148,7 +148,7 @@ class BlockManagerMaster(
           s" with removeFromMaster = $removeFromMaster - ${e.getMessage}}")
     }(ThreadUtils.sameThread)
     if (blocking) {
-      Await.result(future, timeout)
+      timeout.awaitResult(future)
     }
   }
   /**

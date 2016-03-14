@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-    package org.apache.spark.examples
+package org.apache.spark.examples
 
 import org.apache.spark.{SparkContext, SparkConf}
 
