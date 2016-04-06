@@ -956,7 +956,7 @@ _string_functions = {
     'lower': 'Converts a string column to lower case.',
     'upper': 'Converts a string column to upper case.',
     'reverse': 'Reverses the string column and returns it as a new string column.',
-    'ltrim': 'Trim the spaces from right end for the specified string value.',
+    'ltrim': 'Trim the spaces from left end for the specified string value.',
     'rtrim': 'Trim the spaces from right end for the specified string value.',
     'trim': 'Trim the spaces from both ends for the specified string column.',
 }
@@ -1422,14 +1422,15 @@ class UserDefinedFunction(object):
         self._judf = self._create_judf(name)
 
     def _create_judf(self, name):
+        from pyspark.sql import SQLContext
         f, returnType = self.func, self.returnType  # put them in closure `func`
         func = lambda _, it: map(lambda x: returnType.toInternal(f(*x)), it)
         ser = AutoBatchedSerializer(PickleSerializer())
         command = (func, None, ser, ser)
         sc = SparkContext._active_spark_context
         pickled_command, broadcast_vars, env, includes = _prepare_for_python_RDD(sc, command, self)
-        ssql_ctx = sc._jvm.SQLContext(sc._jsc.sc())
-        jdt = ssql_ctx.parseDataType(self.returnType.json())
+        ctx = SQLContext._instantiatedContext
+        jdt = ctx._ssql_ctx.parseDataType(self.returnType.json())
         if name is None:
             name = f.__name__ if hasattr(f, '__name__') else f.__class__.__name__
         judf = sc._jvm.UserDefinedPythonFunction(name, bytearray(pickled_command), env, includes,

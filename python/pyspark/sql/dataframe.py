@@ -548,7 +548,7 @@ class DataFrame(object):
             If `on` is a string or a list of string indicating the name of the join column(s),
             the column(s) must exist on both sides, and this performs an inner equi-join.
         :param how: str, default 'inner'.
-            One of `inner`, `outer`, `left_outer`, `right_outer`, `semijoin`.
+            One of `inner`, `outer`, `left_outer`, `right_outer`, `leftsemi`.
 
         >>> df.join(df2, df.name == df2.name, 'outer').select(df.name, df2.height).collect()
         [Row(name=None, height=80), Row(name=u'Alice', height=None), Row(name=u'Bob', height=85)]
@@ -570,6 +570,7 @@ class DataFrame(object):
         if on is None or len(on) == 0:
             jdf = self._jdf.join(other._jdf)
         elif isinstance(on[0], basestring):
+            assert how is None or how == 'inner', "Equi-join does not support: %s" % how
             jdf = self._jdf.join(other._jdf, self._jseq(on))
         else:
             assert isinstance(on[0], Column), "on should be Column or list of Column"
