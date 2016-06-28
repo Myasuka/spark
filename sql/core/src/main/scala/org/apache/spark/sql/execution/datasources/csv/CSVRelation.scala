@@ -19,17 +19,19 @@ package org.apache.spark.sql.execution.datasources.csv
 
 import scala.util.control.NonFatal
 
-import org.apache.hadoop.fs.{FileStatus, Path}
+import org.apache.hadoop.fs.Path
 import org.apache.hadoop.io.{NullWritable, Text}
 import org.apache.hadoop.mapreduce.RecordWriter
 import org.apache.hadoop.mapreduce.TaskAttemptContext
 import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat
 
-import org.apache.spark.Logging
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.sources._
+import org.apache.spark.sql.catalyst.expressions.GenericMutableRow
+import org.apache.spark.sql.execution.command.CreateDataSourceTableUtils
+import org.apache.spark.sql.execution.datasources.{OutputWriter, OutputWriterFactory, PartitionedFile}
 import org.apache.spark.sql.types._
 
 object CSVRelation extends Logging {
@@ -40,22 +42,27 @@ object CSVRelation extends Logging {
       firstLine: String,
       params: CSVOptions): RDD[Array[String]] = {
     // If header is set, make sure firstLine is materialized before sending to executors.
-    file.mapPartitionsWithIndex({
-      case (split, iter) => new BulkCsvReader(
+    file.mapPartitions { iter =>
+      new BulkCsvReader(
         if (params.headerFlag) iter.filterNot(_ == firstLine) else iter,
         params,
         headers = header)
-    }, true)
+    }
   }
 
-  def parseCsv(
-      tokenizedRDD: RDD[Array[String]],
+  /**
+   * Returns a function that parses a single CSV record (in the form of an array of strings in which
+   * each element represents a column) and turns it into either one resulting row or no row (if the
+   * the record is malformed).
+   *
+   * The 2nd argument in the returned function represents the total number of malformed rows
+   * observed so far.
+   */
+  // This is pretty convoluted and we should probably rewrite the entire CSV parsing soon.
+  def csvParser(
       schema: StructType,
       requiredColumns: Array[String],
-      inputs: Array[FileStatus],
-      sqlContext: SQLContext,
-      params: CSVOptions): RDD[Row] = {
-
+      params: CSVOptions): (Array[String], Int) => Option[InternalRow] = {
     val schemaFields = schema.fields
     val requiredFields = StructType(requiredColumns.map(schema(_))).fields
     val safeRequiredFields = if (params.dropMalformed) {
@@ -71,11 +78,19 @@ object CSVRelation extends Logging {
     }.foreach {
       case (field, index) => safeRequiredIndices(safeRequiredFields.indexOf(field)) = index
     }
-    val rowArray = new Array[Any](safeRequiredIndices.length)
     val requiredSize = requiredFields.length
-    tokenizedRDD.flatMap { tokens =>
+    val row = new GenericMutableRow(requiredSize)
+
+    (tokens: Array[String], numMalformedRows) => {
       if (params.dropMalformed && schemaFields.length != tokens.length) {
-        logWarning(s"Dropping malformed line: ${tokens.mkString(params.delimiter.toString)}")
+        if (numMalformedRows < params.maxMalformedLogPerPartition) {
+          logWarning(s"Dropping malformed line: ${tokens.mkString(params.delimiter.toString)}")
+        }
+        if (numMalformedRows == params.maxMalformedLogPerPartition - 1) {
+          logWarning(
+            s"More than ${params.maxMalformedLogPerPartition} malformed records have been " +
+            "found on this partition. Malformed records from now on will not be logged.")
+        }
         None
       } else if (params.failFast && schemaFields.length != tokens.length) {
         throw new RuntimeException(s"Malformed line in FAILFAST mode: " +
@@ -94,21 +109,52 @@ object CSVRelation extends Logging {
           while (subIndex < safeRequiredIndices.length) {
             index = safeRequiredIndices(subIndex)
             val field = schemaFields(index)
-            rowArray(subIndex) = CSVTypeCast.castTo(
+            // It anyway needs to try to parse since it decides if this row is malformed
+            // or not after trying to cast in `DROPMALFORMED` mode even if the casted
+            // value is not stored in the row.
+            val value = CSVTypeCast.castTo(
               indexSafeTokens(index),
               field.dataType,
               field.nullable,
-              params.nullValue)
+              params)
+            if (subIndex < requiredSize) {
+              row(subIndex) = value
+            }
             subIndex = subIndex + 1
           }
-          Some(Row.fromSeq(rowArray.take(requiredSize)))
+          Some(row)
         } catch {
           case NonFatal(e) if params.dropMalformed =>
-            logWarning("Parse exception. " +
-              s"Dropping malformed line: ${tokens.mkString(params.delimiter.toString)}")
+            if (numMalformedRows < params.maxMalformedLogPerPartition) {
+              logWarning("Parse exception. " +
+                s"Dropping malformed line: ${tokens.mkString(params.delimiter.toString)}")
+            }
+            if (numMalformedRows == params.maxMalformedLogPerPartition - 1) {
+              logWarning(
+                s"More than ${params.maxMalformedLogPerPartition} malformed records have been " +
+                "found on this partition. Malformed records from now on will not be logged.")
+            }
             None
         }
       }
+    }
+  }
+
+  // Skips the header line of each file if the `header` option is set to true.
+  def dropHeaderLine(
+      file: PartitionedFile, lines: Iterator[String], csvOptions: CSVOptions): Unit = {
+    // TODO What if the first partitioned file consists of only comments and empty lines?
+    if (csvOptions.headerFlag && file.start == 0) {
+      val nonEmptyLines = if (csvOptions.isCommentSet) {
+        val commentPrefix = csvOptions.comment.toString
+        lines.dropWhile { line =>
+          line.trim.isEmpty || line.trim.startsWith(commentPrefix)
+        }
+      } else {
+        lines.dropWhile(_.trim.isEmpty)
+      }
+
+      if (nonEmptyLines.hasNext) nonEmptyLines.drop(1)
     }
   }
 }
@@ -137,7 +183,7 @@ private[sql] class CsvOutputWriter(
     new TextOutputFormat[NullWritable, Text]() {
       override def getDefaultWorkFile(context: TaskAttemptContext, extension: String): Path = {
         val configuration = context.getConfiguration
-        val uniqueWriteJobId = configuration.get("spark.sql.sources.writeJobUUID")
+        val uniqueWriteJobId = configuration.get(CreateDataSourceTableUtils.DATASOURCE_WRITEJOBUUID)
         val taskAttemptId = context.getTaskAttemptID
         val split = taskAttemptId.getTaskID.getId
         new Path(path, f"part-r-$split%05d-$uniqueWriteJobId.csv$extension")
@@ -145,8 +191,8 @@ private[sql] class CsvOutputWriter(
     }.getRecordWriter(context)
   }
 
-  private var firstRow: Boolean = params.headerFlag
-
+  private val FLUSH_BATCH_SIZE = 1024L
+  private var records: Long = 0L
   private val csvWriter = new LineCsvWriter(params, dataSchema.fieldNames.toSeq)
 
   private def rowToString(row: Seq[Any]): Seq[String] = row.map { field =>
@@ -160,16 +206,24 @@ private[sql] class CsvOutputWriter(
   override def write(row: Row): Unit = throw new UnsupportedOperationException("call writeInternal")
 
   override protected[sql] def writeInternal(row: InternalRow): Unit = {
-    // TODO: Instead of converting and writing every row, we should use the univocity buffer
-    val resultString = csvWriter.writeRow(rowToString(row.toSeq(dataSchema)), firstRow)
-    if (firstRow) {
-      firstRow = false
+    csvWriter.writeRow(rowToString(row.toSeq(dataSchema)), records == 0L && params.headerFlag)
+    records += 1
+    if (records % FLUSH_BATCH_SIZE == 0) {
+      flush()
     }
-    text.set(resultString)
-    recordWriter.write(NullWritable.get(), text)
+  }
+
+  private def flush(): Unit = {
+    val lines = csvWriter.flush()
+    if (lines.nonEmpty) {
+      text.set(lines)
+      recordWriter.write(NullWritable.get(), text)
+    }
   }
 
   override def close(): Unit = {
+    flush()
+    csvWriter.close()
     recordWriter.close(context)
   }
 }

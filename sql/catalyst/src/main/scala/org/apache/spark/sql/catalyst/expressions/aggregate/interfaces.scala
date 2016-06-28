@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.types._
@@ -66,6 +67,19 @@ private[sql] case object NoOp extends Expression with Unevaluable {
   override def children: Seq[Expression] = Nil
 }
 
+object AggregateExpression {
+  def apply(
+      aggregateFunction: AggregateFunction,
+      mode: AggregateMode,
+      isDistinct: Boolean): AggregateExpression = {
+    AggregateExpression(
+      aggregateFunction,
+      mode,
+      isDistinct,
+      NamedExpression.newExprId)
+  }
+}
+
 /**
  * A container for an [[AggregateFunction]] with its [[AggregateMode]] and a field
  * (`isDistinct`) indicating if DISTINCT keyword is specified for this function.
@@ -73,9 +87,30 @@ private[sql] case object NoOp extends Expression with Unevaluable {
 private[sql] case class AggregateExpression(
     aggregateFunction: AggregateFunction,
     mode: AggregateMode,
-    isDistinct: Boolean)
+    isDistinct: Boolean,
+    resultId: ExprId)
   extends Expression
   with Unevaluable {
+
+  lazy val resultAttribute: Attribute = if (aggregateFunction.resolved) {
+    AttributeReference(
+      aggregateFunction.toString,
+      aggregateFunction.dataType,
+      aggregateFunction.nullable)(exprId = resultId)
+  } else {
+    // This is a bit of a hack.  Really we should not be constructing this container and reasoning
+    // about datatypes / aggregation mode until after we have finished analysis and made it to
+    // planning.
+    UnresolvedAttribute(aggregateFunction.toString)
+  }
+
+  // We compute the same thing regardless of our final result.
+  override lazy val canonicalized: Expression =
+    AggregateExpression(
+      aggregateFunction.canonicalized.asInstanceOf[AggregateFunction],
+      mode,
+      isDistinct,
+      ExprId(0))
 
   override def children: Seq[Expression] = aggregateFunction :: Nil
   override def dataType: DataType = aggregateFunction.dataType
@@ -91,7 +126,14 @@ private[sql] case class AggregateExpression(
     AttributeSet(childReferences)
   }
 
-  override def toString: String = s"($aggregateFunction,mode=$mode,isDistinct=$isDistinct)"
+  override def toString: String = {
+    val prefix = mode match {
+      case Partial => "partial_"
+      case PartialMerge => "merge_"
+      case Final | Complete => ""
+    }
+    prefix + aggregateFunction.toAggString(isDistinct)
+  }
 
   override def sql: String = aggregateFunction.sql(isDistinct)
 }
@@ -167,6 +209,12 @@ sealed abstract class AggregateFunction extends Expression with ImplicitCastInpu
   def sql(isDistinct: Boolean): String = {
     val distinct = if (isDistinct) "DISTINCT " else ""
     s"$prettyName($distinct${children.map(_.sql).mkString(", ")})"
+  }
+
+  /** String representation used in explain plans. */
+  def toAggString(isDistinct: Boolean): String = {
+    val start = if (isDistinct) "(distinct " else "("
+    prettyName + flatArguments.mkString(start, ", ", ")")
   }
 }
 

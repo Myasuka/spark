@@ -32,17 +32,23 @@ import org.apache.spark.sql.catalyst.expressions.{Cast, Literal}
 import org.apache.spark.sql.types._
 
 
-object Partition {
-  def apply(values: InternalRow, path: String): Partition =
+object PartitionDirectory {
+  def apply(values: InternalRow, path: String): PartitionDirectory =
     apply(values, new Path(path))
 }
 
-private[sql] case class Partition(values: InternalRow, path: Path)
+/**
+ * Holds a directory in a partitioned collection of files as well as as the partition values
+ * in the form of a Row.  Before scanning, the files at `path` need to be enumerated.
+ */
+private[sql] case class PartitionDirectory(values: InternalRow, path: Path)
 
-private[sql] case class PartitionSpec(partitionColumns: StructType, partitions: Seq[Partition])
+private[sql] case class PartitionSpec(
+    partitionColumns: StructType,
+    partitions: Seq[PartitionDirectory])
 
 private[sql] object PartitionSpec {
-  val emptySpec = PartitionSpec(StructType(Seq.empty[StructField]), Seq.empty[Partition])
+  val emptySpec = PartitionSpec(StructType(Seq.empty[StructField]), Seq.empty[PartitionDirectory])
 }
 
 private[sql] object PartitioningUtils {
@@ -88,7 +94,7 @@ private[sql] object PartitioningUtils {
     }.unzip
 
     // We create pairs of (path -> path's partition value) here
-    // If the corresponding partition value is None, the pair will be skiped
+    // If the corresponding partition value is None, the pair will be skipped
     val pathsWithPartitionValues = paths.zip(partitionValues).flatMap(x => x._2.map(x._1 -> _))
 
     if (pathsWithPartitionValues.isEmpty) {
@@ -133,7 +139,7 @@ private[sql] object PartitioningUtils {
       // Finally, we create `Partition`s based on paths and resolved partition values.
       val partitions = resolvedPartitionValues.zip(pathsWithPartitionValues).map {
         case (PartitionValues(_, literals), (path, _)) =>
-          Partition(InternalRow.fromSeq(literals.map(_.value)), path)
+          PartitionDirectory(InternalRow.fromSeq(literals.map(_.value)), path)
       }
 
       PartitionSpec(StructType(fields), partitions)
@@ -153,7 +159,7 @@ private[sql] object PartitioningUtils {
    *     Seq(
    *       Literal.create(42, IntegerType),
    *       Literal.create("hello", StringType),
-   *       Literal.create(3.14, FloatType)))
+   *       Literal.create(3.14, DoubleType)))
    * }}}
    * and the path when we stop the discovery is:
    * {{{
@@ -333,7 +339,7 @@ private[sql] object PartitioningUtils {
   private val upCastingOrder: Seq[DataType] =
     Seq(NullType, IntegerType, LongType, FloatType, DoubleType, StringType)
 
-  def validatePartitionColumnDataTypes(
+  def validatePartitionColumn(
       schema: StructType,
       partitionColumns: Seq[String],
       caseSensitive: Boolean): Unit = {
@@ -344,6 +350,10 @@ private[sql] object PartitioningUtils {
         case _ => throw new AnalysisException(s"Cannot use ${field.dataType} for partition column")
       }
     }
+
+    if (partitionColumns.size == schema.fields.size) {
+      throw new AnalysisException(s"Cannot use all columns for partition columns")
+    }
   }
 
   def partitionColumnsSchema(
@@ -353,7 +363,7 @@ private[sql] object PartitioningUtils {
     val equality = columnNameEquality(caseSensitive)
     StructType(partitionColumns.map { col =>
       schema.find(f => equality(f.name, col)).getOrElse {
-        throw new RuntimeException(s"Partition column $col not found in schema $schema")
+        throw new AnalysisException(s"Partition column $col not found in schema $schema")
       }
     }).asNullable
   }
@@ -418,7 +428,7 @@ private[sql] object PartitioningUtils {
     path.foreach { c =>
       if (needsEscaping(c)) {
         builder.append('%')
-        builder.append(f"${c.asInstanceOf[Int]}%02x")
+        builder.append(f"${c.asInstanceOf[Int]}%02X")
       } else {
         builder.append(c)
       }
@@ -435,9 +445,9 @@ private[sql] object PartitioningUtils {
       val c = path.charAt(i)
       if (c == '%' && i + 2 < path.length) {
         val code: Int = try {
-          Integer.valueOf(path.substring(i + 1, i + 3), 16)
-        } catch { case e: Exception =>
-          -1: Integer
+          Integer.parseInt(path.substring(i + 1, i + 3), 16)
+        } catch {
+          case _: Exception => -1
         }
         if (code >= 0) {
           sb.append(code.asInstanceOf[Char])

@@ -23,6 +23,10 @@ import org.apache.spark.sql.test.SharedSQLContext
 
 case class IntClass(value: Int)
 
+package object packageobject {
+  case class PackageClass(value: Int)
+}
+
 class DatasetPrimitiveSuite extends QueryTest with SharedSQLContext {
   import testImplicits._
 
@@ -58,15 +62,15 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSQLContext {
 
   test("foreach") {
     val ds = Seq(1, 2, 3).toDS()
-    val acc = sparkContext.accumulator(0)
-    ds.foreach(acc += _)
+    val acc = sparkContext.longAccumulator
+    ds.foreach(acc.add(_))
     assert(acc.value == 6)
   }
 
   test("foreachPartition") {
     val ds = Seq(1, 2, 3).toDS()
-    val acc = sparkContext.accumulator(0)
-    ds.foreachPartition(_.foreach(acc +=))
+    val acc = sparkContext.longAccumulator
+    ds.foreachPartition(_.foreach(acc.add(_)))
     assert(acc.value == 6)
   }
 
@@ -78,7 +82,7 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSQLContext {
   test("groupBy function, keys") {
     val ds = Seq(1, 2, 3, 4, 5).toDS()
     val grouped = ds.groupByKey(_ % 2)
-    checkDataset(
+    checkDatasetUnorderly(
       grouped.keys,
       0, 1)
   }
@@ -91,7 +95,7 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSQLContext {
       (name, iter.size)
     }
 
-    checkDataset(
+    checkDatasetUnorderly(
       agged,
       ("even", 5), ("odd", 6))
   }
@@ -101,7 +105,7 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSQLContext {
     val grouped = ds.groupByKey(_.length)
     val agged = grouped.flatMapGroups { case (g, iter) => Iterator(g.toString, iter.mkString) }
 
-    checkDataset(
+    checkDatasetUnorderly(
       agged,
       "1", "abc", "3", "xyz", "5", "hello")
   }
@@ -127,4 +131,10 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSQLContext {
     checkDataset(Seq(Array("test")).toDS(), Array("test"))
     checkDataset(Seq(Array(Tuple1(1))).toDS(), Array(Tuple1(1)))
   }
+
+  test("package objects") {
+    import packageobject._
+    checkDataset(Seq(PackageClass(1)).toDS(), PackageClass(1))
+  }
+
 }

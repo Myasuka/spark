@@ -29,6 +29,7 @@ import org.apache.spark.deploy.{ApplicationDescription, Command}
 import org.apache.spark.deploy.DeployMessages.{MasterStateResponse, RequestMasterState}
 import org.apache.spark.deploy.master.{ApplicationInfo, Master}
 import org.apache.spark.deploy.worker.Worker
+import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.util.Utils
 
@@ -159,13 +160,13 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
     master.self.askWithRetry[MasterStateResponse](RequestMasterState)
   }
 
-  /** Get the applictions that are active from Master */
+  /** Get the applications that are active from Master */
   private def getApplications(): Seq[ApplicationInfo] = {
     getMasterState.activeApps
   }
 
   /** Application Listener to collect events */
-  private class AppClientCollector extends AppClientListener with Logging {
+  private class AppClientCollector extends StandaloneAppClientListener with Logging {
     val connectedIdList = new ConcurrentLinkedQueue[String]()
     @volatile var disconnectedCount: Int = 0
     val deadReasonList = new ConcurrentLinkedQueue[String]()
@@ -207,7 +208,7 @@ class AppClientSuite extends SparkFunSuite with LocalSparkContext with BeforeAnd
       List(), Map(), Seq(), Seq(), Seq())
     private val desc = new ApplicationDescription("AppClientSuite", Some(1), 512, cmd, "ignored")
     val listener = new AppClientCollector
-    val client = new AppClient(rpcEnv, Array(masterUrl), desc, listener, new SparkConf)
+    val client = new StandaloneAppClient(rpcEnv, Array(masterUrl), desc, listener, new SparkConf)
   }
 
 }

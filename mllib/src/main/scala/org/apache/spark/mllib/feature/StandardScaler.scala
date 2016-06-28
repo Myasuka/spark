@@ -17,8 +17,8 @@
 
 package org.apache.spark.mllib.feature
 
-import org.apache.spark.Logging
 import org.apache.spark.annotation.{DeveloperApi, Since}
+import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.linalg.{DenseVector, SparseVector, Vector, Vectors}
 import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
 import org.apache.spark.rdd.RDD
@@ -26,6 +26,11 @@ import org.apache.spark.rdd.RDD
 /**
  * Standardizes features by removing the mean and scaling to unit std using column summary
  * statistics on the samples in the training set.
+ *
+ * The "unit std" is computed using the
+ * [[https://en.wikipedia.org/wiki/Standard_deviation#Corrected_sample_standard_deviation
+ *   corrected sample standard deviation]],
+ * which is computed as the square root of the unbiased sample variance.
  *
  * @param withMean False by default. Centers the data with mean before scaling. It will build a
  *                 dense output, so this does not work on sparse input and will raise an exception.
@@ -92,6 +97,9 @@ class StandardScalerModel @Since("1.3.0") (
   @Since("1.3.0")
   def this(std: Vector) = this(std, null)
 
+  /**
+   * :: DeveloperApi ::
+   */
   @Since("1.3.0")
   @DeveloperApi
   def setWithMean(withMean: Boolean): this.type = {
@@ -100,6 +108,9 @@ class StandardScalerModel @Since("1.3.0") (
     this
   }
 
+  /**
+   * :: DeveloperApi ::
+   */
   @Since("1.3.0")
   @DeveloperApi
   def setWithStd(withStd: Boolean): this.type = {

@@ -26,14 +26,14 @@ if sys.version >= '3':
 else:
     from itertools import imap as map
 
-from pyspark import since
+from pyspark import copy_func, since
 from pyspark.rdd import RDD, _load_from_socket, ignore_unicode_prefix
 from pyspark.serializers import BatchedSerializer, PickleSerializer, UTF8Deserializer
 from pyspark.storagelevel import StorageLevel
 from pyspark.traceback_utils import SCCallSiteSync
 from pyspark.sql.types import _parse_datatype_json_string
 from pyspark.sql.column import Column, _to_seq, _to_list, _to_java_column
-from pyspark.sql.readwriter import DataFrameWriter
+from pyspark.sql.readwriter import DataFrameWriter, DataStreamWriter
 from pyspark.sql.types import *
 
 __all__ = ["DataFrame", "DataFrameNaFunctions", "DataFrameStatFunctions"]
@@ -60,10 +60,8 @@ class DataFrame(object):
         people = sqlContext.read.parquet("...")
         department = sqlContext.read.parquet("...")
 
-        people.filter(people.age > 30).join(department, people.deptId == department.id)) \
+        people.filter(people.age > 30).join(department, people.deptId == department.id)\
           .groupBy(department.name, "gender").agg({"salary": "avg", "age": "max"})
-
-    .. note:: Experimental
 
     .. versionadded:: 1.3
     """
@@ -121,21 +119,78 @@ class DataFrame(object):
         that was used to create this :class:`DataFrame`.
 
         >>> df.registerTempTable("people")
-        >>> df2 = sqlContext.sql("select * from people")
+        >>> df2 = spark.sql("select * from people")
         >>> sorted(df.collect()) == sorted(df2.collect())
         True
+        >>> spark.catalog.dropTempView("people")
+
+        .. note:: Deprecated in 2.0, use createOrReplaceTempView instead.
         """
-        self._jdf.registerTempTable(name)
+        self._jdf.createOrReplaceTempView(name)
+
+    @since(2.0)
+    def createTempView(self, name):
+        """Creates a temporary view with this DataFrame.
+
+        The lifetime of this temporary table is tied to the :class:`SparkSession`
+        that was used to create this :class:`DataFrame`.
+        throws :class:`TempTableAlreadyExistsException`, if the view name already exists in the
+        catalog.
+
+        >>> df.createTempView("people")
+        >>> df2 = spark.sql("select * from people")
+        >>> sorted(df.collect()) == sorted(df2.collect())
+        True
+        >>> df.createTempView("people")  # doctest: +IGNORE_EXCEPTION_DETAIL
+        Traceback (most recent call last):
+        ...
+        AnalysisException: u"Temporary table 'people' already exists;"
+        >>> spark.catalog.dropTempView("people")
+
+        """
+        self._jdf.createTempView(name)
+
+    @since(2.0)
+    def createOrReplaceTempView(self, name):
+        """Creates or replaces a temporary view with this DataFrame.
+
+        The lifetime of this temporary table is tied to the :class:`SparkSession`
+        that was used to create this :class:`DataFrame`.
+
+        >>> df.createOrReplaceTempView("people")
+        >>> df2 = df.filter(df.age > 3)
+        >>> df2.createOrReplaceTempView("people")
+        >>> df3 = spark.sql("select * from people")
+        >>> sorted(df3.collect()) == sorted(df2.collect())
+        True
+        >>> spark.catalog.dropTempView("people")
+
+        """
+        self._jdf.createOrReplaceTempView(name)
 
     @property
     @since(1.4)
     def write(self):
         """
-        Interface for saving the content of the :class:`DataFrame` out into external storage.
+        Interface for saving the content of the non-streaming :class:`DataFrame` out into external
+        storage.
 
         :return: :class:`DataFrameWriter`
         """
         return DataFrameWriter(self)
+
+    @property
+    @since(2.0)
+    def writeStream(self):
+        """
+        Interface for saving the content of the streaming :class:`DataFrame` out into external
+        storage.
+
+        .. note:: Experimental.
+
+        :return: :class:`DataStreamWriter`
+        """
+        return DataStreamWriter(self)
 
     @property
     @since(1.3)
@@ -173,8 +228,7 @@ class DataFrame(object):
 
         >>> df.explain()
         == Physical Plan ==
-        WholeStageCodegen
-        :  +- Scan ExistingRDD[age#0,name#1]
+        Scan ExistingRDD[age#0,name#1]
 
         >>> df.explain(True)
         == Parsed Logical Plan ==
@@ -197,6 +251,20 @@ class DataFrame(object):
         (without any Spark executors).
         """
         return self._jdf.isLocal()
+
+    @property
+    @since(2.0)
+    def isStreaming(self):
+        """Returns true if this :class:`Dataset` contains one or more sources that continuously
+        return data as it arrives. A :class:`Dataset` that reads data from a streaming source
+        must be executed as a :class:`StreamingQuery` using the :func:`startStream` method in
+        :class:`DataFrameWriter`.  Methods that return a single answer, (e.g., :func:`count` or
+        :func:`collect`) will throw an :class:`AnalysisException` when there is a streaming
+        source present.
+
+        .. note:: Experimental
+        """
+        return self._jdf.isStreaming()
 
     @since(1.3)
     def show(self, n=20, truncate=True):
@@ -240,6 +308,20 @@ class DataFrame(object):
         with SCCallSiteSync(self._sc) as css:
             port = self._jdf.collectToPython()
         return list(_load_from_socket(port, BatchedSerializer(PickleSerializer())))
+
+    @ignore_unicode_prefix
+    @since(2.0)
+    def toLocalIterator(self):
+        """
+        Returns an iterator that contains all of the rows in this :class:`DataFrame`.
+        The iterator will consume as much memory as the largest partition in this DataFrame.
+
+        >>> list(df.toLocalIterator())
+        [Row(age=2, name=u'Alice'), Row(age=5, name=u'Bob')]
+        """
+        with SCCallSiteSync(self._sc) as css:
+            port = self._jdf.toPythonIterator()
+        return _load_from_socket(port, BatchedSerializer(PickleSerializer()))
 
     @ignore_unicode_prefix
     @since(1.3)
@@ -313,9 +395,11 @@ class DataFrame(object):
         return self
 
     @since(1.3)
-    def unpersist(self, blocking=True):
+    def unpersist(self, blocking=False):
         """Marks the :class:`DataFrame` as non-persistent, and remove all blocks for it from
         memory and disk.
+
+        .. note:: `blocking` default has changed to False to match Scala in 2.0.
         """
         self.is_cached = False
         self._jdf.unpersist(blocking)
@@ -337,15 +421,6 @@ class DataFrame(object):
         return DataFrame(self._jdf.coalesce(numPartitions), self.sql_ctx)
 
     @since(1.3)
-    def repartition(self, numPartitions):
-        """Returns a new :class:`DataFrame` that has exactly ``numPartitions`` partitions.
-
-        >>> df.repartition(10).rdd.getNumPartitions()
-        10
-        """
-        return DataFrame(self._jdf.repartition(numPartitions), self.sql_ctx)
-
-    @since(1.3)
     def repartition(self, numPartitions, *cols):
         """
         Returns a new :class:`DataFrame` partitioned by the given partitioning expressions. The
@@ -361,7 +436,7 @@ class DataFrame(object):
 
         >>> df.repartition(10).rdd.getNumPartitions()
         10
-        >>> data = df.unionAll(df).repartition("age")
+        >>> data = df.union(df).repartition("age")
         >>> data.show()
         +---+-----+
         |age| name|
@@ -515,7 +590,7 @@ class DataFrame(object):
         >>> df_as2 = df.alias("df_as2")
         >>> joined_df = df_as1.join(df_as2, col("df_as1.name") == col("df_as2.name"), 'inner')
         >>> joined_df.select("df_as1.name", "df_as2.name", "df_as2.age").collect()
-        [Row(name=u'Alice', name=u'Alice', age=2), Row(name=u'Bob', name=u'Bob', age=5)]
+        [Row(name=u'Bob', name=u'Bob', age=5), Row(name=u'Alice', name=u'Alice', age=2)]
         """
         assert isinstance(alias, basestring), "alias should be a string"
         return DataFrame(getattr(self._jdf, "as")(alias), self.sql_ctx)
@@ -830,8 +905,6 @@ class DataFrame(object):
             raise TypeError("condition should be string or Column")
         return DataFrame(jdf, self.sql_ctx)
 
-    where = filter
-
     @ignore_unicode_prefix
     @since(1.3)
     def groupBy(self, *cols):
@@ -914,14 +987,24 @@ class DataFrame(object):
         """
         return self.groupBy().agg(*exprs)
 
+    @since(2.0)
+    def union(self, other):
+        """ Return a new :class:`DataFrame` containing union of rows in this
+        frame and another frame.
+
+        This is equivalent to `UNION ALL` in SQL. To do a SQL-style set union
+        (that does deduplication of elements), use this function followed by a distinct.
+        """
+        return DataFrame(self._jdf.union(other._jdf), self.sql_ctx)
+
     @since(1.3)
     def unionAll(self, other):
         """ Return a new :class:`DataFrame` containing union of rows in this
         frame and another frame.
 
-        This is equivalent to `UNION ALL` in SQL.
+        .. note:: Deprecated in 2.0, use union instead.
         """
-        return DataFrame(self._jdf.unionAll(other._jdf), self.sql_ctx)
+        return self.union(other)
 
     @since(1.3)
     def intersect(self, other):
@@ -1362,8 +1445,20 @@ class DataFrame(object):
     # Pandas compatibility
     ##########################################################################################
 
-    groupby = groupBy
-    drop_duplicates = dropDuplicates
+    groupby = copy_func(
+        groupBy,
+        sinceversion=1.4,
+        doc=":func:`groupby` is an alias for :func:`groupBy`.")
+
+    drop_duplicates = copy_func(
+        dropDuplicates,
+        sinceversion=1.4,
+        doc=":func:`drop_duplicates` is an alias for :func:`dropDuplicates`.")
+
+    where = copy_func(
+        filter,
+        sinceversion=1.3,
+        doc=":func:`where` is an alias for :func:`filter`.")
 
 
 def _to_scala_map(sc, jm):
@@ -1441,12 +1536,13 @@ class DataFrameStatFunctions(object):
 def _test():
     import doctest
     from pyspark.context import SparkContext
-    from pyspark.sql import Row, SQLContext
+    from pyspark.sql import Row, SQLContext, SparkSession
     import pyspark.sql.dataframe
     globs = pyspark.sql.dataframe.__dict__.copy()
     sc = SparkContext('local[4]', 'PythonTest')
     globs['sc'] = sc
     globs['sqlContext'] = SQLContext(sc)
+    globs['spark'] = SparkSession(sc)
     globs['df'] = sc.parallelize([(2, 'Alice'), (5, 'Bob')])\
         .toDF(StructType([StructField('age', IntegerType()),
                           StructField('name', StringType())]))

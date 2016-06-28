@@ -54,7 +54,8 @@ function makeIdNumeric(id) {
 }
 
 function formatDate(date) {
-  return date.split(".")[0].replace("T", " ");
+  if (date <= 0) return "-";
+  else return date.split(".")[0].replace("T", " ");
 }
 
 function getParameterByName(name, searchString) {
@@ -123,28 +124,13 @@ $(document).ready(function() {
         if (app["attempts"].length > 1) {
             hasMultipleAttempts = true;
         }
-
-        var maxAttemptId = null
+        var num = app["attempts"].length;
         for (j in app["attempts"]) {
           var attempt = app["attempts"][j];
-          if (attempt['attemptId'] != null) {
-            if (maxAttemptId == null || attempt['attemptId'] > maxAttemptId) {
-              maxAttemptId = attempt['attemptId']
-            }
-          }
-
           attempt["startTime"] = formatDate(attempt["startTime"]);
           attempt["endTime"] = formatDate(attempt["endTime"]);
           attempt["lastUpdated"] = formatDate(attempt["lastUpdated"]);
-
-          var url = null
-          if (maxAttemptId == null) {
-            url = "history/" + id + "/"
-          } else {
-            url = "history/" + id + "/" + maxAttemptId + "/"
-          }
-
-          var app_clone = {"id" : id, "name" : name, "url" : url, "attempts" : [attempt]};
+          var app_clone = {"id" : id, "name" : name, "num" : num, "attempts" : [attempt]};
           array.push(app_clone);
         }
       }

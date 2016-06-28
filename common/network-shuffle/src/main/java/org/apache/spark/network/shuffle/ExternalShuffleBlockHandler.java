@@ -35,6 +35,7 @@ import org.apache.spark.network.server.RpcHandler;
 import org.apache.spark.network.server.StreamManager;
 import org.apache.spark.network.shuffle.ExternalShuffleBlockResolver.AppExecId;
 import org.apache.spark.network.shuffle.protocol.*;
+import org.apache.spark.network.util.NettyUtils;
 import org.apache.spark.network.util.TransportConf;
 
 
@@ -52,7 +53,8 @@ public class ExternalShuffleBlockHandler extends RpcHandler {
   final ExternalShuffleBlockResolver blockManager;
   private final OneForOneStreamManager streamManager;
 
-  public ExternalShuffleBlockHandler(TransportConf conf, File registeredExecutorFile) throws IOException {
+  public ExternalShuffleBlockHandler(TransportConf conf, File registeredExecutorFile)
+    throws IOException {
     this(new OneForOneStreamManager(),
       new ExternalShuffleBlockResolver(conf, registeredExecutorFile));
   }
@@ -85,7 +87,11 @@ public class ExternalShuffleBlockHandler extends RpcHandler {
         blocks.add(blockManager.getBlockData(msg.appId, msg.execId, blockId));
       }
       long streamId = streamManager.registerStream(client.getClientId(), blocks.iterator());
-      logger.trace("Registered streamId {} with {} buffers", streamId, msg.blockIds.length);
+      logger.trace("Registered streamId {} with {} buffers for client {} from host {}",
+          streamId,
+          msg.blockIds.length,
+          client.getClientId(),
+          NettyUtils.getRemoteAddress(client.getChannel()));
       callback.onSuccess(new StreamHandle(streamId, msg.blockIds.length).toByteBuffer());
 
     } else if (msgObj instanceof RegisterExecutor) {
