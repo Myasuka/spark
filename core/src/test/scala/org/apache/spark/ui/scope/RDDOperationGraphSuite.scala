@@ -14,24 +14,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.spark.status.api.v1
 
-import javax.ws.rs.WebApplicationException
-
-import org.scalatest.Matchers
+package org.apache.spark.ui.scope
 
 import org.apache.spark.SparkFunSuite
 
-class SimpleDateParamSuite extends SparkFunSuite with Matchers {
+class RDDOperationGraphSuite extends SparkFunSuite {
+  test("Test simple cluster equals") {
+    // create a 2-cluster chain with a child
+    val c1 = new RDDOperationCluster("1", "Bender")
+    val c2 = new RDDOperationCluster("2", "Hal")
+    c1.attachChildCluster(c2)
+    c1.attachChildNode(new RDDOperationNode(3, "Marvin", false, "collect!"))
 
-  test("date parsing") {
-    new SimpleDateParam("2015-02-20T23:21:17.190GMT").timestamp should be (1424474477190L)
-    // don't use EST, it is ambiguous, use -0500 instead, see SPARK-15723
-    new SimpleDateParam("2015-02-20T17:21:17.190-0500").timestamp should be (1424470877190L)
-    new SimpleDateParam("2015-02-20").timestamp should be (1424390400000L) // GMT
-    intercept[WebApplicationException] {
-      new SimpleDateParam("invalid date")
-    }
+    // create an equal cluster, but without the child node
+    val c1copy = new RDDOperationCluster("1", "Bender")
+    val c2copy = new RDDOperationCluster("2", "Hal")
+    c1copy.attachChildCluster(c2copy)
+
+    assert(c1 == c1copy)
   }
-
 }

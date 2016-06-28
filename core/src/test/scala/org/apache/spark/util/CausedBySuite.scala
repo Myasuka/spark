@@ -14,24 +14,43 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.spark.status.api.v1
 
-import javax.ws.rs.WebApplicationException
-
-import org.scalatest.Matchers
+package org.apache.spark.util
 
 import org.apache.spark.SparkFunSuite
 
-class SimpleDateParamSuite extends SparkFunSuite with Matchers {
+class CausedBySuite extends SparkFunSuite {
 
-  test("date parsing") {
-    new SimpleDateParam("2015-02-20T23:21:17.190GMT").timestamp should be (1424474477190L)
-    // don't use EST, it is ambiguous, use -0500 instead, see SPARK-15723
-    new SimpleDateParam("2015-02-20T17:21:17.190-0500").timestamp should be (1424470877190L)
-    new SimpleDateParam("2015-02-20").timestamp should be (1424390400000L) // GMT
-    intercept[WebApplicationException] {
-      new SimpleDateParam("invalid date")
+  test("For an error without a cause, should return the error") {
+    val error = new Exception
+
+    val causedBy = error match {
+      case CausedBy(e) => e
     }
+
+    assert(causedBy === error)
   }
 
+  test("For an error with a cause, should return the cause of the error") {
+    val cause = new Exception
+    val error = new Exception(cause)
+
+    val causedBy = error match {
+      case CausedBy(e) => e
+    }
+
+    assert(causedBy === cause)
+  }
+
+  test("For an error with a cause that itself has a cause, return the root cause") {
+    val causeOfCause = new Exception
+    val cause = new Exception(causeOfCause)
+    val error = new Exception(cause)
+
+    val causedBy = error match {
+      case CausedBy(e) => e
+    }
+
+    assert(causedBy === causeOfCause)
+  }
 }
