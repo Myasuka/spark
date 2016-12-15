@@ -25,7 +25,7 @@ import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.SparkContext
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.{JavaPairRDD, JavaRDD}
 import org.apache.spark.graphx.{Edge, EdgeContext, Graph, VertexId}
 import org.apache.spark.mllib.linalg.{Matrices, Matrix, Vector, Vectors}
@@ -66,7 +66,7 @@ abstract class LDAModel private[clustering] extends Saveable {
    *
    * This is the parameter to a symmetric Dirichlet distribution.
    *
-   * Note: The topics' distributions over terms are called "beta" in the original LDA paper
+   * @note The topics' distributions over terms are called "beta" in the original LDA paper
    * by Blei et al., but are called "phi" in many later papers such as Asuncion et al., 2009.
    */
   @Since("1.5.0")
@@ -171,7 +171,7 @@ abstract class LDAModel private[clustering] extends Saveable {
    *                   The term count vectors are "bags of words" with a fixed-size vocabulary
    *                   (where the vocabulary size is the length of the vector).
    *                   This must use the same vocabulary (ordering of term counts) as in training.
-   *                   Document IDs must be unique and >= 0.
+   *                   Document IDs must be unique and greater than or equal to 0.
    * @return  Estimated topic distribution for each document.
    *          The returned RDD may be zipped with the given RDD, where each returned vector
    *          is a multinomial distribution over topics.
@@ -392,7 +392,7 @@ class LocalLDAModel private[spark] (
    * literature).  Returns a vector of zeros for an empty document.
    *
    * Note this means to allow quick query for single document. For batch documents, please refer
-   * to [[topicDistributions()]] to avoid overhead.
+   * to `topicDistributions()` to avoid overhead.
    *
    * @param document document to predict topic mixture distributions for
    * @return topic mixture distribution for the document
@@ -426,13 +426,10 @@ class LocalLDAModel private[spark] (
 }
 
 /**
- * :: Experimental ::
- *
  * Local (non-distributed) model fitted by [[LDA]].
  *
  * This model stores the inferred topics only; it does not store info about the training dataset.
  */
-@Experimental
 @Since("1.5.0")
 object LocalLDAModel extends Loader[LocalLDAModel] {
 
@@ -787,7 +784,13 @@ class DistributedLDAModel private[clustering] (
   @Since("1.5.0")
   def topTopicsPerDocument(k: Int): RDD[(Long, Array[Int], Array[Double])] = {
     graph.vertices.filter(LDA.isDocumentVertex).map { case (docID, topicCounts) =>
-      val topIndices = argtopk(topicCounts, k)
+      // TODO: Remove work-around for the breeze bug.
+      // https://github.com/scalanlp/breeze/issues/561
+      val topIndices = if (k == topicCounts.length) {
+        Seq.range(0, k)
+      } else {
+        argtopk(topicCounts, k)
+      }
       val sumCounts = sum(topicCounts)
       val weights = if (sumCounts != 0) {
         topicCounts(topIndices) / sumCounts
@@ -822,15 +825,12 @@ class DistributedLDAModel private[clustering] (
 }
 
 /**
- * :: Experimental ::
- *
  * Distributed model fitted by [[LDA]].
  * This type of model is currently only produced by Expectation-Maximization (EM).
  *
  * This model stores the inferred topics, the full training dataset, and the topic distribution
  * for each training document.
  */
-@Experimental
 @Since("1.5.0")
 object DistributedLDAModel extends Loader[DistributedLDAModel] {
 

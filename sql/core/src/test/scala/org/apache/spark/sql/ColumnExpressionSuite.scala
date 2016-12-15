@@ -122,66 +122,6 @@ class ColumnExpressionSuite extends QueryTest with SharedSQLContext {
     assert(newCol.expr.asInstanceOf[NamedExpression].metadata.getString("key") === "value")
   }
 
-  test("single explode") {
-    val df = Seq((1, Seq(1, 2, 3))).toDF("a", "intList")
-    checkAnswer(
-      df.select(explode('intList)),
-      Row(1) :: Row(2) :: Row(3) :: Nil)
-  }
-
-  test("explode and other columns") {
-    val df = Seq((1, Seq(1, 2, 3))).toDF("a", "intList")
-
-    checkAnswer(
-      df.select($"a", explode('intList)),
-      Row(1, 1) ::
-      Row(1, 2) ::
-      Row(1, 3) :: Nil)
-
-    checkAnswer(
-      df.select($"*", explode('intList)),
-      Row(1, Seq(1, 2, 3), 1) ::
-      Row(1, Seq(1, 2, 3), 2) ::
-      Row(1, Seq(1, 2, 3), 3) :: Nil)
-  }
-
-  test("aliased explode") {
-    val df = Seq((1, Seq(1, 2, 3))).toDF("a", "intList")
-
-    checkAnswer(
-      df.select(explode('intList).as('int)).select('int),
-      Row(1) :: Row(2) :: Row(3) :: Nil)
-
-    checkAnswer(
-      df.select(explode('intList).as('int)).select(sum('int)),
-      Row(6) :: Nil)
-  }
-
-  test("explode on map") {
-    val df = Seq((1, Map("a" -> "b"))).toDF("a", "map")
-
-    checkAnswer(
-      df.select(explode('map)),
-      Row("a", "b"))
-  }
-
-  test("explode on map with aliases") {
-    val df = Seq((1, Map("a" -> "b"))).toDF("a", "map")
-
-    checkAnswer(
-      df.select(explode('map).as("key1" :: "value1" :: Nil)).select("key1", "value1"),
-      Row("a", "b"))
-  }
-
-  test("self join explode") {
-    val df = Seq((1, Seq(1, 2, 3))).toDF("a", "intList")
-    val exploded = df.select(explode('intList).as('i))
-
-    checkAnswer(
-      exploded.join(exploded, exploded("i") === exploded("i")).agg(count("*")),
-      Row(3) :: Nil)
-  }
-
   test("collect on column produced by a binary operator") {
     val df = Seq((1, 2, 3)).toDF("a", "b", "c")
     checkAnswer(df.select(df("a") + df("b")), Seq(Row(3)))
@@ -568,18 +508,17 @@ class ColumnExpressionSuite extends QueryTest with SharedSQLContext {
       Row("ab", "cde"))
   }
 
-  test("monotonicallyIncreasingId") {
+  test("monotonically_increasing_id") {
     // Make sure we have 2 partitions, each with 2 records.
     val df = sparkContext.parallelize(Seq[Int](), 2).mapPartitions { _ =>
       Iterator(Tuple1(1), Tuple1(2))
     }.toDF("a")
     checkAnswer(
-      df.select(monotonicallyIncreasingId()),
-      Row(0L) :: Row(1L) :: Row((1L << 33) + 0L) :: Row((1L << 33) + 1L) :: Nil
-    )
-    checkAnswer(
-      df.select(expr("monotonically_increasing_id()")),
-      Row(0L) :: Row(1L) :: Row((1L << 33) + 0L) :: Row((1L << 33) + 1L) :: Nil
+      df.select(monotonically_increasing_id(), expr("monotonically_increasing_id()")),
+      Row(0L, 0L) ::
+        Row(1L, 1L) ::
+        Row((1L << 33) + 0L, (1L << 33) + 0L) ::
+        Row((1L << 33) + 1L, (1L << 33) + 1L) :: Nil
     )
   }
 
@@ -594,31 +533,54 @@ class ColumnExpressionSuite extends QueryTest with SharedSQLContext {
     )
   }
 
-  test("input_file_name - FileScanRDD") {
+  test("input_file_name, input_file_block_start, input_file_block_length - FileScanRDD") {
     withTempPath { dir =>
       val data = sparkContext.parallelize(0 to 10).toDF("id")
       data.write.parquet(dir.getCanonicalPath)
-      val answer = spark.read.parquet(dir.getCanonicalPath).select(input_file_name())
-        .head.getString(0)
-      assert(answer.contains(dir.getCanonicalPath))
 
-      checkAnswer(data.select(input_file_name()).limit(1), Row(""))
+      // Test the 3 expressions when reading from files
+      val q = spark.read.parquet(dir.getCanonicalPath).select(
+        input_file_name(), expr("input_file_block_start()"), expr("input_file_block_length()"))
+      val firstRow = q.head()
+      assert(firstRow.getString(0).contains(dir.getCanonicalPath))
+      assert(firstRow.getLong(1) == 0)
+      assert(firstRow.getLong(2) > 0)
+
+      // Now read directly from the original RDD without going through any files to make sure
+      // we are returning empty string, -1, and -1.
+      checkAnswer(
+        data.select(
+          input_file_name(), expr("input_file_block_start()"), expr("input_file_block_length()")
+        ).limit(1),
+        Row("", -1L, -1L))
     }
   }
 
-  test("input_file_name - HadoopRDD") {
+  test("input_file_name, input_file_block_start, input_file_block_length - HadoopRDD") {
     withTempPath { dir =>
       val data = sparkContext.parallelize((0 to 10).map(_.toString)).toDF()
       data.write.text(dir.getCanonicalPath)
       val df = spark.sparkContext.textFile(dir.getCanonicalPath).toDF()
-      val answer = df.select(input_file_name()).head.getString(0)
-      assert(answer.contains(dir.getCanonicalPath))
 
-      checkAnswer(data.select(input_file_name()).limit(1), Row(""))
+      // Test the 3 expressions when reading from files
+      val q = df.select(
+        input_file_name(), expr("input_file_block_start()"), expr("input_file_block_length()"))
+      val firstRow = q.head()
+      assert(firstRow.getString(0).contains(dir.getCanonicalPath))
+      assert(firstRow.getLong(1) == 0)
+      assert(firstRow.getLong(2) > 0)
+
+      // Now read directly from the original RDD without going through any files to make sure
+      // we are returning empty string, -1, and -1.
+      checkAnswer(
+        data.select(
+          input_file_name(), expr("input_file_block_start()"), expr("input_file_block_length()")
+        ).limit(1),
+        Row("", -1L, -1L))
     }
   }
 
-  test("input_file_name - NewHadoopRDD") {
+  test("input_file_name, input_file_block_start, input_file_block_length - NewHadoopRDD") {
     withTempPath { dir =>
       val data = sparkContext.parallelize((0 to 10).map(_.toString)).toDF()
       data.write.text(dir.getCanonicalPath)
@@ -628,10 +590,22 @@ class ColumnExpressionSuite extends QueryTest with SharedSQLContext {
         classOf[LongWritable],
         classOf[Text])
       val df = rdd.map(pair => pair._2.toString).toDF()
-      val answer = df.select(input_file_name()).head.getString(0)
-      assert(answer.contains(dir.getCanonicalPath))
 
-      checkAnswer(data.select(input_file_name()).limit(1), Row(""))
+      // Test the 3 expressions when reading from files
+      val q = df.select(
+        input_file_name(), expr("input_file_block_start()"), expr("input_file_block_length()"))
+      val firstRow = q.head()
+      assert(firstRow.getString(0).contains(dir.getCanonicalPath))
+      assert(firstRow.getLong(1) == 0)
+      assert(firstRow.getLong(2) > 0)
+
+      // Now read directly from the original RDD without going through any files to make sure
+      // we are returning empty string, -1, and -1.
+      checkAnswer(
+        data.select(
+          input_file_name(), expr("input_file_block_start()"), expr("input_file_block_length()")
+        ).limit(1),
+        Row("", -1L, -1L))
     }
   }
 

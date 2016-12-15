@@ -30,7 +30,7 @@ import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
  * for classes whose fields are entirely defined by constructor params but should not be
  * case classes.
  */
-private[sql] trait DefinedByConstructorParams
+trait DefinedByConstructorParams
 
 
 /**
@@ -342,7 +342,7 @@ object ScalaReflection extends ScalaReflection {
 
         StaticInvoke(
           ArrayBasedMapData.getClass,
-          ObjectType(classOf[Map[_, _]]),
+          ObjectType(classOf[scala.collection.immutable.Map[_, _]]),
           "toScalaMap",
           keyData :: valueData :: Nil)
 
@@ -441,6 +441,22 @@ object ScalaReflection extends ScalaReflection {
           val newPath = s"""- array element class: "$clsName"""" +: walkedTypePath
           MapObjects(serializerFor(_, elementType, newPath), input, dt)
 
+         case dt @ (BooleanType | ByteType | ShortType | IntegerType | LongType |
+                    FloatType | DoubleType) =>
+          val cls = input.dataType.asInstanceOf[ObjectType].cls
+          if (cls.isArray && cls.getComponentType.isPrimitive) {
+            StaticInvoke(
+              classOf[UnsafeArrayData],
+              ArrayType(dt, false),
+              "fromPrimitiveArray",
+              input :: Nil)
+          } else {
+            NewInstance(
+              classOf[GenericArrayData],
+              input :: Nil,
+              dataType = ArrayType(dt, schemaFor(elementType).nullable))
+          }
+
         case dt =>
           NewInstance(
             classOf[GenericArrayData],
@@ -472,29 +488,18 @@ object ScalaReflection extends ScalaReflection {
 
       case t if t <:< localTypeOf[Map[_, _]] =>
         val TypeRef(_, _, Seq(keyType, valueType)) = t
+        val keyClsName = getClassNameFromType(keyType)
+        val valueClsName = getClassNameFromType(valueType)
+        val keyPath = s"""- map key class: "$keyClsName"""" +: walkedTypePath
+        val valuePath = s"""- map value class: "$valueClsName"""" +: walkedTypePath
 
-        val keys =
-          Invoke(
-            Invoke(inputObject, "keysIterator",
-              ObjectType(classOf[scala.collection.Iterator[_]])),
-            "toSeq",
-            ObjectType(classOf[scala.collection.Seq[_]]))
-        val convertedKeys = toCatalystArray(keys, keyType)
-
-        val values =
-          Invoke(
-            Invoke(inputObject, "valuesIterator",
-              ObjectType(classOf[scala.collection.Iterator[_]])),
-            "toSeq",
-            ObjectType(classOf[scala.collection.Seq[_]]))
-        val convertedValues = toCatalystArray(values, valueType)
-
-        val Schema(keyDataType, _) = schemaFor(keyType)
-        val Schema(valueDataType, valueNullable) = schemaFor(valueType)
-        NewInstance(
-          classOf[ArrayBasedMapData],
-          convertedKeys :: convertedValues :: Nil,
-          dataType = MapType(keyDataType, valueDataType, valueNullable))
+        ExternalMapToCatalyst(
+          inputObject,
+          dataTypeFor(keyType),
+          serializerFor(_, keyType, keyPath),
+          dataTypeFor(valueType),
+          serializerFor(_, valueType, valuePath),
+          valueNullable = !valueType.typeSymbol.asClass.isPrimitive)
 
       case t if t <:< localTypeOf[String] =>
         StaticInvoke(
@@ -586,7 +591,9 @@ object ScalaReflection extends ScalaReflection {
               "cannot be used as field name\n" + walkedTypePath.mkString("\n"))
           }
 
-          val fieldValue = Invoke(inputObject, fieldName, dataTypeFor(fieldType))
+          val fieldValue = Invoke(
+            AssertNotNull(inputObject, walkedTypePath), fieldName, dataTypeFor(fieldType),
+            returnNullable = !fieldType.typeSymbol.asClass.isPrimitive)
           val clsName = getClassNameFromType(fieldType)
           val newPath = s"""- field (class: "$clsName", name: "$fieldName")""" +: walkedTypePath
           expressions.Literal(fieldName) :: serializerFor(fieldValue, fieldType, newPath) :: Nil
@@ -599,6 +606,19 @@ object ScalaReflection extends ScalaReflection {
           s"No Encoder found for $tpe\n" + walkedTypePath.mkString("\n"))
     }
 
+  }
+
+  /**
+   * Returns true if the given type is option of product type, e.g. `Option[Tuple2]`. Note that,
+   * we also treat [[DefinedByConstructorParams]] as product type.
+   */
+  def optionOfProductType(tpe: `Type`): Boolean = ScalaReflectionLock.synchronized {
+    tpe match {
+      case t if t <:< localTypeOf[Option[_]] =>
+        val TypeRef(_, _, Seq(optType)) = t
+        definedByConstructorParams(optType)
+      case _ => false
+    }
   }
 
   /**
@@ -640,7 +660,7 @@ object ScalaReflection extends ScalaReflection {
   /*
    * Retrieves the runtime class corresponding to the provided type.
    */
-  def getClassFromType(tpe: Type): Class[_] = mirror.runtimeClass(tpe.erasure.typeSymbol.asClass)
+  def getClassFromType(tpe: Type): Class[_] = mirror.runtimeClass(tpe.typeSymbol.asClass)
 
   case class Schema(dataType: DataType, nullable: Boolean)
 
@@ -720,7 +740,7 @@ object ScalaReflection extends ScalaReflection {
   /**
    * Whether the fields of the given type is defined entirely by its constructor parameters.
    */
-  private[sql] def definedByConstructorParams(tpe: Type): Boolean = {
+  def definedByConstructorParams(tpe: Type): Boolean = {
     tpe <:< localTypeOf[Product] || tpe <:< localTypeOf[DefinedByConstructorParams]
   }
 
